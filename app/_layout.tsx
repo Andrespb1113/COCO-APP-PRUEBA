@@ -1,24 +1,22 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
+/**
+ * Layout raíz del simulador COCO.
+ * Configuración mínima: una sola pantalla, sin tabs, sin header.
+ * La barra de estado se oculta para simular un dispositivo de hardware.
+ *
+ * SafeAreaProvider es obligatorio para que SafeAreaView funcione
+ * correctamente en todos los dispositivos (notch, barra de navegación, etc.)
+ */
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import 'react-native-reanimated';
-
-import { useColorScheme } from '@/hooks/use-color-scheme';
-
-export const unstable_settings = {
-  anchor: '(tabs)',
-};
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 export default function RootLayout() {
-  const colorScheme = useColorScheme();
-
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
-      </Stack>
-      <StatusBar style="auto" />
-    </ThemeProvider>
+    <SafeAreaProvider>
+      {/* Pantalla principal: sin header para experiencia Zero-UI */}
+      <Stack screenOptions={{ headerShown: false }} />
+      {/* Barra de estado oscura para contraste con el fondo negro */}
+      <StatusBar style="light" backgroundColor="#0A0A0A" />
+    </SafeAreaProvider>
   );
 }
