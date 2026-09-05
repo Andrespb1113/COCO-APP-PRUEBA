@@ -16,7 +16,7 @@ export default function RootLayout() {
       {/* Pantalla principal: sin header para experiencia Zero-UI */}
       <Stack screenOptions={{ headerShown: false }} />
       {/* Barra de estado oscura para contraste con el fondo negro */}
-      <StatusBar style="light" backgroundColor="#0A0A0A" />
+      <StatusBar style="light" />
     </SafeAreaProvider>
   );
 }

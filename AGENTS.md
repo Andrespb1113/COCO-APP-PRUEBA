@@ -314,6 +314,114 @@ Ahora es el flujo principal del dispositivo. Implementado con `useAudioRecorder`
   3. **Protección de Inactividad:**
      - Si pasan 8s sin que se emita voz, la grabación se cancela limpiamente sin enviar payloads vacíos.
 
+#### Próximos pasos pendientes (superados en iteración 9)
+- [x] Configurar credenciales reales de AWS IoT Core vía `.env`.
+- [x] Validar publicación contra AWS IoT Core real con SigV4.
+
+---
+
+### Iteración 9 — 2026-09-05: Conexión MQTT real con SigV4 a AWS IoT Core
+
+> Se configuró la conexión MQTT sobre WebSockets apuntando a AWS IoT Core (us-east-2) mediante variables de entorno seguras. Se validó la suscripción al tópico `coco/simulador/rx` y el despacho híbrido (SOS directo y Audio Base64) hacia `coco/simulador/tx` cumpliendo el contrato de hardware.
+
+#### ¿Qué hicimos?
+
+**1. Variables de entorno (`.env`)**
+- Creado `.env` en la raíz del proyecto con las variables `EXPO_PUBLIC_*` que Expo expone automáticamente en runtime.
+- Agregado `.env` al `.gitignore` para proteger las credenciales de commits accidentales.
+
+**2. Módulo `mqttClient.js` [NUEVO]**
+- Encapsula toda la lógica de conexión a AWS IoT Core.
+- Genera una **URL WebSocket pre-firmada con AWS Signature V4** usando la librería `aws-signature-v4`, que es el mecanismo de autenticación estándar de AWS para IoT Core sin certificados X.509.
+- Al conectar exitosamente (`on('connect')`), se suscribe automáticamente al tópico de bajada `coco/simulador/rx`.
+- Expone `DEVICE_MAC`, `AWS_IOT_ENDPOINT` y `conectarMQTT(onMensaje)`.
+
+**3. Actualización de `iotContract.js`**
+- Las constantes de conexión (`AWS_ENDPOINT`) ahora se re-exportan desde `mqttClient.js`.
+- Ya no hay strings hardcodeados con credenciales.
+
+**4. Actualización de `app/index.tsx`**
+- La MAC del dispositivo se lee de `DEVICE_MAC` (variable de entorno `EXPO_PUBLIC_DEVICE_MAC`).
+- El `useEffect` de MQTT ahora llama a `conectarMQTT()` en vez de construir el cliente directamente.
+- Nuevo estado `ultimoMensajeRx` para capturar mensajes que lleguen del backend.
+- El SOS ahora usa el campo `data: 'EMERGENCIA_BOTON_PANICO'` exacto del contrato.
+
+#### Archivos modificados
+- `.env` — **[NUEVO]** Variables de entorno AWS IoT Core.
+- `.gitignore` — Agregada regla `.env` (separada de `.env*.local`).
+- `mqttClient.js` — **[NUEVO]** Módulo de conexión con SigV4.
+- `iotContract.js` — Actualizado para re-exportar desde `mqttClient.js`.
+- `app/index.tsx` — MAC desde env, MQTT vía `conectarMQTT`, SOS con `data` corregido.
+
+#### Librería instalada
+- `aws-signature-v4` — `npm install aws-signature-v4` — Genera URLs pre-firmadas con SigV4.
+
+#### ⚠️ Regla crítica a recordar (7)
+> **Para conectarse a AWS IoT Core via WebSocket, la URL DEBE estar firmada con AWS Signature V4.**
+> No basta con pasar `username`/`password` en las opciones de `mqtt.connect()`.
+> Usar `aws-signature-v4` (o equivalente) para generar la URL `wss://` firmada antes de llamar `mqtt.connect(url)`.
+
 #### Próximos pasos pendientes
-- [ ] Proveer `AWS_ENDPOINT`, `ACCESS_KEY` y `SECRET_KEY` en `iotContract.js`.
-- [ ] Validar publicación contra AWS IoT Core real.
+- [x] Rellenar `EXPO_PUBLIC_AWS_ACCESS_KEY_ID` y `EXPO_PUBLIC_AWS_SECRET_ACCESS_KEY` en `.env` con las credenciales reales.
+- [x] Reiniciar Expo (`npx expo start --clear`) para que tome las nuevas variables de entorno.
+- [x] Verificar en terminal la línea `[MQTT] Conectado exitosamente a AWS IoT Core.`
+- [x] Validar que el botón SOS publica `EMERGENCIA_BOTON_PANICO` en AWS IoT Core Console → Test → Subscribe to topic.
+
+---
+
+### Iteración 10 — 2026-09-05: Flujo Completo Bidireccional MQTT con AWS IoT Core y Upgrade a Expo SDK 57
+
+> **Hito alcanzado:** El simulador COCO cuenta con comunicación bidireccional en tiempo real 100% operativa y validada con AWS IoT Core. Se completó con éxito el despacho ascendente (TX en `coco/simulador/tx`) tanto para emergencias como para audio, y la recepción y procesamiento descendente (RX en `coco/simulador/rx`). Se resolvió la incompatibilidad de Node.js en React Native implementando SigV4 puro en JavaScript y se migró el proyecto a Expo SDK 57.
+
+#### ¿Qué hicimos?
+
+**1. Configuración Segura de Credenciales Reales (`.env`)**
+- Se registraron en `.env` las credenciales IAM reales (`EXPO_PUBLIC_AWS_ACCESS_KEY_ID` y `EXPO_PUBLIC_AWS_SECRET_ACCESS_KEY`).
+- Se respaldaron los certificados X.509 y llaves RSA en la carpeta `certs/`.
+- Se reforzó `.gitignore` para asegurar que ni `.env` ni la carpeta `certs/` jamás sean versionados en el repositorio Git.
+
+**2. Actualización a Expo SDK 57**
+- Debido a una actualización de la aplicación móvil Expo Go en el dispositivo físico a SDK 57, se actualizó el proyecto ejecutando `npm install expo@latest` y `npx expo install --fix`.
+- Se corrigió la propiedad `backgroundColor` en `<StatusBar />` dentro de `app/_layout.tsx` para cumplir con los tipos de SDK 57.
+- Se corrigió `playsInSilentMode` en las llamadas a `setAudioModeAsync` dentro de `app/index.tsx`.
+- Verificación exitosa de TypeScript (`npx tsc --noEmit` con 0 errores).
+
+**3. Implementación de SigV4 100% compatible con React Native (`crypto-js`)**
+- **Problema detectado:** Al compilar en Expo Go, el paquete `aws-signature-v4` falló con:
+  `The package at "node_modules\aws-signature-v4\index.js" attempted to import the Node standard library module "crypto". It failed because the native React runtime does not include the Node standard library.`
+- **Solución:** Se desinstaló `aws-signature-v4` y se instaló `crypto-js` (implementación de criptografía en JavaScript puro).
+- Se implementó en `mqttClient.js` la generación matemática completa de la firma AWS SigV4:
+  - Generación de timestamps ISO y compactos (`X-Amz-Date`, `dateStamp`).
+  - Creación de claves derivadas (`kDate`, `kRegion`, `kService`, `kSigning`).
+  - Construcción del Canonical Request con parámetros de consulta ordenados alfabéticamente.
+  - Generación del String to Sign y cálculo de firma HMAC-SHA256 final en hexadecimal.
+  - Retorno de URL WebSocket (`wss://`) pre-firmada para autenticación sin certificados en puerto 443.
+
+**4. Validación en Vivo del Flujo Bidireccional**
+- **Conexión:** Establecida exitosamente con el endpoint `a32v3a5dqlwvvo-ats.iot.us-east-2.amazonaws.com` y Client ID `coco-simulador-001122AABBCC`.
+- **Suscripción:** Suscrito automáticamente a `coco/simulador/rx` con QoS 1.
+- **Flujo Ascendente (TX):** El simulador despacha eventos JSON al pulsar SOS (`ALERTA_SOS` con `EMERGENCIA_BOTON_PANICO`) y al grabar voz (`MENSAJE` con audio Base64), recibidos exitosamente en la consola de AWS IoT Core.
+- **Flujo Descendente (RX):** Los payloads JSON enviados desde AWS IoT Core hacia `coco/simulador/rx` son capturados por el cliente MQTT y procesados en tiempo real en la aplicación.
+
+#### Archivos modificados / creados
+- `.env` — Credenciales reales de AWS IoT Core cargadas (ignorado en Git).
+- `.gitignore` — Protección añadida para `.env`, `.env*.local` y `certs/`.
+- `certs/` — Llaves públicas y privadas respaldadas localmente (ignorado en Git).
+- `package.json` y `package-lock.json` — Dependencias actualizadas a Expo SDK 57 y `crypto-js`.
+- `app/_layout.tsx` — Compatibilidad con StatusBar en SDK 57.
+- `app/index.tsx` — Ajuste de parámetros de audio y suscripción a eventos MQTT.
+- `mqttClient.js` — Módulo completo de conexión MQTT con firma SigV4 mediante `crypto-js`.
+- `AGENTS.md` — Documentación detallada de la arquitectura, reglas y flujo de la iteración.
+
+#### ⚠️ Regla crítica a recordar (8)
+> **En React Native / Expo Go NUNCA uses librerías que dependan del módulo `crypto` de Node.js.**
+> Librerías como `aws-signature-v4` o el SDK nativo de AWS asumen el entorno de Node.js y fallarán al compilar en el bundler de React Native.
+> Usa siempre librerías en JavaScript puro como `crypto-js` para firmas HMAC-SHA256 y SigV4 en el frontend móvil.
+
+#### Estado del Simulador
+- [x] Interfaz de hardware Zero-UI.
+- [x] Grabación y parada automática por detección de voz / silencio (VAD en 2 fases).
+- [x] Conversión y empaquetado de audio en Base64.
+- [x] Contrato IoT estricto implementado y validado.
+- [x] Conexión MQTT en tiempo real con AWS IoT Core vía WebSockets + SigV4.
+- [x] Comunicación bidireccional completa (TX y RX probados con éxito).

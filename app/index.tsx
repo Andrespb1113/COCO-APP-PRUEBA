@@ -46,22 +46,28 @@ import {
   setAudioModeAsync,
   requestRecordingPermissionsAsync,
 } from 'expo-audio';
-import mqtt, { MqttClient } from 'mqtt';
+import { MqttClient } from 'mqtt';
 
-// Importamos el Contrato IoT: funcion de validacion + ensamblaje + constantes
+// Contrato IoT: validacion y ensamblaje de payloads
 import {
   generarPayload,
   TOPICO_TX,
-  AWS_ENDPOINT,
 } from '../iotContract';
+
+// Cliente MQTT con firma SigV4 para AWS IoT Core
+import {
+  conectarMQTT,
+  DEVICE_MAC,
+  AWS_IOT_ENDPOINT,
+} from '../mqttClient';
 
 const { width } = Dimensions.get('window');
 
 // Tamano del boton SOS: 65% del ancho de pantalla
 const SOS_BUTTON_SIZE = width * 0.65;
 
-// MAC Address del dispositivo simulado (identificador de hardware)
-const MAC_ADDRESS_SIMULADOR = '00:11:22:33:44:55';
+// MAC Address leida desde .env (EXPO_PUBLIC_DEVICE_MAC)
+const MAC_ADDRESS_SIMULADOR = DEVICE_MAC;
 
 export default function PantallaPrincipal() {
   // Estado del campo de texto libre
@@ -113,10 +119,9 @@ export default function PantallaPrincipal() {
   const latidoSOS = useRef(new Animated.Value(1)).current;
 
   // ─────────────────────────────────────────────────────────────
-  // Cliente MQTT (mqtt / MQTT.js — pure JS, compatible con Expo Go)
-  // Nota: AWS_ENDPOINT esta vacio hasta recibir credenciales.
-  //       El cliente intentara conectar; si falla lo registra en consola
-  //       pero la app sigue funcionando (el payload se imprime siempre).
+  // Cliente MQTT con SigV4 — AWS IoT Core via WebSocket
+  // Las credenciales se leen de .env (EXPO_PUBLIC_AWS_*)
+  // mqttClient.js maneja la firma SigV4 y la suscripcion al topico RX.
   // ─────────────────────────────────────────────────────────────
 
   // Referencia al cliente MQTT (no provoca re-renders al cambiar)
@@ -125,48 +130,45 @@ export default function PantallaPrincipal() {
   // Estado de conexion visible en la UI
   const [connected, setConnected] = useState(false);
 
+  // Ultimo mensaje recibido desde el backend (topico RX)
+  const [ultimoMensajeRx, setUltimoMensajeRx] = useState<string | null>(null);
+
   useEffect(() => {
-    // Solo intentar conectar si existe un endpoint configurado
-    if (!AWS_ENDPOINT) {
+    // Verificacion rapida de credenciales antes de conectar
+    if (!AWS_IOT_ENDPOINT) {
       console.log(
-        '[COCO MQTT] AWS_ENDPOINT vacio. ' +
-        'El cliente no se conectara hasta configurar las credenciales en iotContract.js.'
+        '[MQTT] EXPO_PUBLIC_AWS_IOT_ENDPOINT no configurado. ' +
+        'Completa el archivo .env con las credenciales de AWS IoT Core.'
       );
       return;
     }
 
-    // Formato de URL para AWS IoT Core via WebSocket:
-    // wss://<endpoint>:443/mqtt
-    const brokerUrl = `wss://${AWS_ENDPOINT}:443/mqtt`;
+    // Callback que se ejecuta cuando llega un mensaje desde el backend (RX)
+    const alRecibirMensaje = (topico: string, payloadStr: string) => {
+      console.log(`[MQTT ← RX] Mensaje recibido en '${topico}':`, payloadStr);
+      setUltimoMensajeRx(payloadStr);
+    };
 
-    const client = mqtt.connect(brokerUrl, {
-      clientId: `coco-simulador-${MAC_ADDRESS_SIMULADOR.replace(/:/g, '')}`,
-      // username: ACCESS_KEY,   // Descomentar al tener credenciales
-      // password: SECRET_KEY,   // Descomentar al tener credenciales
-      clean: true,
-      reconnectPeriod: 5000,    // Reintentar cada 5s si se pierde conexion
-    });
+    // Conectar usando la logica de SigV4 encapsulada en mqttClient.js
+    conectarMQTT(alRecibirMensaje)
+      .then(({ client, conectado }) => {
+        if (client) {
+          mqttClientRef.current = client;
+          setConnected(conectado);
 
-    client.on('connect', () => {
-      console.log('[COCO MQTT] Conectado a AWS IoT Core.');
-      setConnected(true);
-    });
-
-    client.on('error', (err) => {
-      console.warn('[COCO MQTT] Error de conexion:', err.message);
-      setConnected(false);
-    });
-
-    client.on('close', () => {
-      console.log('[COCO MQTT] Conexion cerrada.');
-      setConnected(false);
-    });
-
-    mqttClientRef.current = client;
+          // Actualizar estado si la conexion cambia despues de establecerse
+          client.on('close', () => setConnected(false));
+          client.on('error', () => setConnected(false));
+          client.on('connect', () => setConnected(true));
+        }
+      })
+      .catch((err) => {
+        console.error('[MQTT] Error al inicializar cliente:', err.message);
+      });
 
     // Limpieza al desmontar el componente
     return () => {
-      client.end();
+      mqttClientRef.current?.end();
       mqttClientRef.current = null;
     };
   }, []); // Solo se ejecuta una vez al montar
@@ -255,7 +257,8 @@ export default function PantallaPrincipal() {
     ]).start();
 
     // Publica la alerta de panico siguiendo el Contrato IoT
-    despachaMQTT('ALERTA_SOS', 'TEXTO', 'El usuario presiono el boton de emergencia SOS.');
+    // Payload de panico siguiendo el Contrato IoT (campo data estandarizado)
+    despachaMQTT('ALERTA_SOS', 'TEXTO', 'EMERGENCIA_BOTON_PANICO');
   };
 
   // ─────────────────────────────────────────────────────────────
@@ -316,7 +319,7 @@ export default function PantallaPrincipal() {
 
     try {
       // Configura el modo de audio: suena aunque el telefono este en silencio (iOS)
-      await setAudioModeAsync({ playsInSilentModeIOS: true });
+      await setAudioModeAsync({ playsInSilentMode: true });
 
       if (reproduciendo) {
         player.pause();
@@ -487,7 +490,7 @@ export default function PantallaPrincipal() {
         return;
       }
 
-      await setAudioModeAsync({ playsInSilentModeIOS: true });
+      await setAudioModeAsync({ playsInSilentMode: true });
 
       try {
         await audioRecorder.prepareToRecordAsync();
