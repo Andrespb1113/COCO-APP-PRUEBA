@@ -4,16 +4,25 @@
  * Esta pantalla simula la interfaz fisica del dispositivo COCO (Proyecto Zero-UI).
  * Disenada para adultos mayores: botones gigantes, alto contraste, sin menus complejos.
  *
- * Herramientas de debugging presentes (solo UI, logica pendiente):
- *  - Boton SOS (rojo, centro): enviara una alerta de panico a Supabase.
- *  - Input de texto libre + boton Enviar: simula comandos de texto hacia la BD.
- *  - Boton Cargar Audio: abre el explorador de archivos para seleccionar un .mp3/.wav local.
- *  - Boton Reproducir (🔊/⏸): preescucha el audio cargado antes de enviarlo.
- *  - Boton Enviar Audio: sube el archivo a Supabase Storage + registra en BD.
- *  - Boton "Mantener presionado y hablar" (inferior): iniciara grabacion de audio en vivo.
+ * Arquitectura de salida (Contrato IoT):
+ *  - Todos los eventos se publican hacia AWS IoT Core via MQTT.
+ *  - Topico de publicacion: coco/simulador/tx
+ *  - El payload se valida y ensambla en iotContract.js antes del envio.
+ *
+ * Libreria MQTT: 'mqtt' (MQTT.js puro JS via WebSocket).
+ *  - Compatible con Expo Go sin necesidad de Development Build.
+ *  - AWS IoT Core acepta conexiones MQTT sobre WebSocket (wss://).
+ *
+ * Herramientas de debugging presentes:
+ *  - Boton SOS (rojo, centro): publica evento tipo 'ALERTA_SOS' via MQTT.
+ *  - Input de texto libre + boton Enviar: publica evento tipo 'MENSAJE' / 'TEXTO'.
+ *  - Boton Cargar Audio: selecciona un archivo, lo convierte a Base64 y publica via MQTT.
+ *  - Boton Reproducir (sonido/pausa): preescucha el audio cargado antes de enviarlo.
+ *  - Boton "Mantener presionado y hablar" (inferior): graba audio en vivo, convierte a Base64
+ *    y publica via MQTT al soltar (igual que el flujo de cargar archivo, pero desde el mic).
  */
 
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -27,12 +36,32 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as DocumentPicker from 'expo-document-picker';
-import { useAudioPlayer, useAudioPlayerStatus, setAudioModeAsync } from 'expo-audio';
+import { File } from 'expo-file-system';
+import {
+  useAudioPlayer,
+  useAudioPlayerStatus,
+  useAudioRecorder,
+  useAudioRecorderState,
+  RecordingPresets,
+  setAudioModeAsync,
+  requestRecordingPermissionsAsync,
+} from 'expo-audio';
+import mqtt, { MqttClient } from 'mqtt';
+
+// Importamos el Contrato IoT: funcion de validacion + ensamblaje + constantes
+import {
+  generarPayload,
+  TOPICO_TX,
+  AWS_ENDPOINT,
+} from '../iotContract';
 
 const { width } = Dimensions.get('window');
 
 // Tamano del boton SOS: 65% del ancho de pantalla
 const SOS_BUTTON_SIZE = width * 0.65;
+
+// MAC Address del dispositivo simulado (identificador de hardware)
+const MAC_ADDRESS_SIMULADOR = '00:11:22:33:44:55';
 
 export default function PantallaPrincipal() {
   // Estado del campo de texto libre
@@ -41,11 +70,10 @@ export default function PantallaPrincipal() {
   // Estado que muestra el nombre del archivo de audio seleccionado
   const [nombreAudio, setNombreAudio] = useState<string | null>(null);
 
-  // URI local del archivo cargado (necesario para subirlo a Supabase Storage)
+  // URI local del archivo cargado (necesario para leer como Base64)
   const [uriAudio, setUriAudio] = useState<string | null>(null);
 
   // Player de expo-audio — se crea con el URI del archivo cuando hay uno cargado.
-  // Cuando uriAudio es null, se pasa una fuente vacia y el player queda inactivo.
   const player = useAudioPlayer(uriAudio ? { uri: uriAudio } : null);
 
   // Estado en tiempo real del player (isPlaying, didJustFinish, etc.)
@@ -54,23 +82,180 @@ export default function PantallaPrincipal() {
   // Alias legible para saber si esta sonando ahora mismo
   const reproduciendo = estadoPlayer.playing ?? false;
 
+  // ─── Grabacion de audio en vivo con deteccion de silencio adaptativa (VAD) ──────
+  const [grabando, setGrabando] = useState(false);
+  const [haHablado, setHaHablado] = useState(false); // Estado para UI (Esperando vs Escuchando)
+  const grabandoRef = useRef(false);
+  const haHabladoRef = useRef(false);
+
+  // Timestamps y contadores para medir voz y silencio
+  const inicioGrabacionRef = useRef<number>(0);
+  const ultimoSonidoRef = useRef<number>(0);
+  const conteoVozMsRef = useRef<number>(0);
+  const intervaloMonitoreoRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Parametros de calibracion VAD (Voice Activity Detection):
+  // -32 dB es el umbral para discriminar ruido ambiente normal (-40 a -32 dB) de voz (-25 a -5 dB)
+  const UMBRAL_VOZ_DB = -32;
+  const TIEMPO_ESPERA_INICIO_MS = 8000;    // 8s para que el adulto mayor empiece a hablar
+  const VOZ_SOSTENIDA_MIN_MS = 200;        // 200ms de audio continuo para confirmar que empezo a hablar
+  const DURACION_SILENCIO_MS = 1500;       // 1.5s de silencio continuo para auto-enviar tras hablar
+  const TIEMPO_MAXIMO_MS = 20000;          // 20s maximo total de seguridad
+
+  const audioRecorder = useAudioRecorder(
+    { ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true }
+  );
+
+  // Estado reactivo del grabador con muestreo rapido (100ms)
+  const estadoRecorder = useAudioRecorderState(audioRecorder, 100);
+
   // Animacion de pulsacion para el boton SOS
   const latidoSOS = useRef(new Animated.Value(1)).current;
+
+  // ─────────────────────────────────────────────────────────────
+  // Cliente MQTT (mqtt / MQTT.js — pure JS, compatible con Expo Go)
+  // Nota: AWS_ENDPOINT esta vacio hasta recibir credenciales.
+  //       El cliente intentara conectar; si falla lo registra en consola
+  //       pero la app sigue funcionando (el payload se imprime siempre).
+  // ─────────────────────────────────────────────────────────────
+
+  // Referencia al cliente MQTT (no provoca re-renders al cambiar)
+  const mqttClientRef = useRef<MqttClient | null>(null);
+
+  // Estado de conexion visible en la UI
+  const [connected, setConnected] = useState(false);
+
+  useEffect(() => {
+    // Solo intentar conectar si existe un endpoint configurado
+    if (!AWS_ENDPOINT) {
+      console.log(
+        '[COCO MQTT] AWS_ENDPOINT vacio. ' +
+        'El cliente no se conectara hasta configurar las credenciales en iotContract.js.'
+      );
+      return;
+    }
+
+    // Formato de URL para AWS IoT Core via WebSocket:
+    // wss://<endpoint>:443/mqtt
+    const brokerUrl = `wss://${AWS_ENDPOINT}:443/mqtt`;
+
+    const client = mqtt.connect(brokerUrl, {
+      clientId: `coco-simulador-${MAC_ADDRESS_SIMULADOR.replace(/:/g, '')}`,
+      // username: ACCESS_KEY,   // Descomentar al tener credenciales
+      // password: SECRET_KEY,   // Descomentar al tener credenciales
+      clean: true,
+      reconnectPeriod: 5000,    // Reintentar cada 5s si se pierde conexion
+    });
+
+    client.on('connect', () => {
+      console.log('[COCO MQTT] Conectado a AWS IoT Core.');
+      setConnected(true);
+    });
+
+    client.on('error', (err) => {
+      console.warn('[COCO MQTT] Error de conexion:', err.message);
+      setConnected(false);
+    });
+
+    client.on('close', () => {
+      console.log('[COCO MQTT] Conexion cerrada.');
+      setConnected(false);
+    });
+
+    mqttClientRef.current = client;
+
+    // Limpieza al desmontar el componente
+    return () => {
+      client.end();
+      mqttClientRef.current = null;
+    };
+  }, []); // Solo se ejecuta una vez al montar
+
+  /**
+   * publish
+   * -------
+   * Wrapper de publicacion MQTT que verifica la conexion antes de enviar.
+   */
+  const publish = useCallback(
+    (topico: string, mensaje: string): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        const client = mqttClientRef.current;
+        if (!client || !client.connected) {
+          reject(new Error('Cliente MQTT no conectado.'));
+          return;
+        }
+        client.publish(topico, mensaje, { qos: 1 }, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    },
+    []
+  );
+
+  // ─────────────────────────────────────────────────────────────
+  // Funcion central de despacho MQTT
+  // ─────────────────────────────────────────────────────────────
+
+  /**
+   * despachaMQTT
+   * ------------
+   * Valida el payload via el Contrato IoT, lo imprime en consola para
+   * inspeccion y lo publica en el topico coco/simulador/tx.
+   *
+   * @param {string} tipo_evento     - 'MENSAJE' o 'ALERTA_SOS'
+   * @param {string} formato_payload - 'TEXTO' o 'AUDIO_B64'
+   * @param {string} data            - Contenido del evento
+   */
+  const despachaMQTT = useCallback(
+    async (tipo_evento: string, formato_payload: string, data: string) => {
+      try {
+        // Ensambla y valida segun el Contrato IoT (lanza Error si es invalido)
+        const payload = generarPayload(
+          MAC_ADDRESS_SIMULADOR,
+          tipo_evento,
+          formato_payload,
+          data
+        );
+
+        // Inspeccion en terminal (clave para verificar la conversion Base64)
+        console.log('[COCO → IoT] Payload generado:');
+        console.log(JSON.stringify(payload, null, 2));
+
+        // Intenta publicar si hay conexion activa
+        if (connected) {
+          await publish(TOPICO_TX, JSON.stringify(payload));
+          console.log(`[COCO → IoT] Publicado en topico: ${TOPICO_TX}`);
+        } else {
+          console.warn(
+            '[COCO → IoT] Sin conexion MQTT activa. ' +
+            'El payload se genero correctamente pero no fue enviado. ' +
+            '(Normal mientras AWS_ENDPOINT este vacio)'
+          );
+        }
+      } catch (error) {
+        console.error('[COCO → IoT] Error en el despacho:', error);
+      }
+    },
+    [connected, publish]
+  );
 
   // ─────────────────────────────────────────────────────────────
   // Boton SOS
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * Anima el boton SOS con efecto de pulsacion y dispara el evento.
-   * TODO: Insertar evento tipo 'ALERTA_SOS' en historial_interacciones de Supabase.
+   * Anima el boton SOS con efecto de pulsacion y publica el evento ALERTA_SOS
+   * hacia AWS IoT Core via MQTT.
    */
   const animarPresionSOS = () => {
     Animated.sequence([
       Animated.timing(latidoSOS, { toValue: 0.92, duration: 100, useNativeDriver: true }),
       Animated.spring(latidoSOS, { toValue: 1, friction: 3, useNativeDriver: true }),
     ]).start();
-    console.log('[COCO] Boton SOS presionado — logica pendiente.');
+
+    // Publica la alerta de panico siguiendo el Contrato IoT
+    despachaMQTT('ALERTA_SOS', 'TEXTO', 'El usuario presiono el boton de emergencia SOS.');
   };
 
   // ─────────────────────────────────────────────────────────────
@@ -78,13 +263,11 @@ export default function PantallaPrincipal() {
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * Envia el texto escrito como un comando de simulacion hacia Supabase.
-   * TODO: Insertar { emisor: 'COCO', tipo_evento: 'TEXTO_LIBRE', metadata_payload: { texto } }
-   *       en la tabla historial_interacciones.
+   * Envia el texto escrito como un MENSAJE de tipo TEXTO hacia IoT Core.
    */
   const alEnviarTexto = () => {
     if (!textoComando.trim()) return;
-    console.log(`[COCO] Texto enviado: "${textoComando.trim()}"`);
+    despachaMQTT('MENSAJE', 'TEXTO', textoComando.trim());
     setTextoComando(''); // Limpia el campo tras el envio
   };
 
@@ -95,14 +278,12 @@ export default function PantallaPrincipal() {
   /**
    * Abre el explorador de archivos del dispositivo filtrando por audio.
    * Permite seleccionar un .mp3 o .wav ya guardado localmente.
-   * TODO: Con el archivo seleccionado, subirlo a Supabase Storage y crear
-   *       un registro en historial_interacciones con tipo_evento: 'AUDIO_DIRECTO'.
    */
   const alCargarAudio = async () => {
     try {
       const resultado = await DocumentPicker.getDocumentAsync({
         type: ['audio/mpeg', 'audio/wav', 'audio/*'],
-        copyToCacheDirectory: true, // Copia al cache para acceso rapido
+        copyToCacheDirectory: true, // Copia al cache para garantizar acceso de lectura
       });
 
       if (!resultado.canceled && resultado.assets.length > 0) {
@@ -112,7 +293,7 @@ export default function PantallaPrincipal() {
           player.pause();
         }
         setNombreAudio(archivo.name);
-        setUriAudio(archivo.uri); // Cambia el URI y expo-audio recarga el player automaticamente
+        setUriAudio(archivo.uri);
         console.log(`[COCO] Audio seleccionado: ${archivo.name} | URI: ${archivo.uri}`);
       } else {
         console.log('[COCO] Seleccion de audio cancelada.');
@@ -129,12 +310,6 @@ export default function PantallaPrincipal() {
   /**
    * Alterna entre reproducir y pausar el audio cargado localmente.
    * Usa expo-audio (reemplazo de expo-av en SDK 54).
-   *
-   * Flujo:
-   *  - Primera llamada: configura el altavoz y empieza a reproducir.
-   *  - Segunda llamada (mientras suena): pausa la reproduccion.
-   *  - Tercera llamada (pausado): reanuda desde donde quedo.
-   *  - Cuando el audio termina solo: estadoPlayer.playing vuelve a false automaticamente.
    */
   const alReproducirAudio = async () => {
     if (!uriAudio) return;
@@ -144,11 +319,8 @@ export default function PantallaPrincipal() {
       await setAudioModeAsync({ playsInSilentModeIOS: true });
 
       if (reproduciendo) {
-        // Esta sonando: pausar
         player.pause();
       } else {
-        // Esta pausado o no habia empezado: reproducir
-        // Si termino, vuelve al inicio automaticamente antes de play
         if (estadoPlayer.didJustFinish) {
           player.seekTo(0);
         }
@@ -160,61 +332,228 @@ export default function PantallaPrincipal() {
   };
 
   // ─────────────────────────────────────────────────────────────
-  // Envio del audio cargado a Supabase
+  // Envio del audio como Base64 via MQTT
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * Toma el URI local del archivo cargado y simula el mismo flujo
-   * que ocurriria si el usuario hubiera hablado en vivo:
+   * Flujo completo de conversion y despacho de audio:
    *
-   * Flujo completo (TODO — pendiente de integracion con Supabase):
-   *  1. Leer el archivo desde `uriAudio` como un Blob/ArrayBuffer.
-   *  2. Subirlo al bucket 'audios-coco' de Supabase Storage:
-   *       supabase.storage.from('audios-coco').upload(nombreArchivo, blob)
-   *  3. Obtener la URL publica del archivo subido.
-   *  4. Insertar en historial_interacciones:
-   *       { emisor: 'COCO', tipo_evento: 'AUDIO_DIRECTO',
-   *         metadata_payload: { url_audio: urlPublica } }
-   *  5. Limpiar el estado (uriAudio, nombreAudio) para la proxima accion.
+   *  1. Lee el archivo local con FileSystem.readAsStringAsync en modo Base64.
+   *  2. Llama a despachaMQTT con tipo_evento='MENSAJE', formato_payload='AUDIO_B64'.
+   *  3. despachaMQTT ensamblara el payload via el Contrato IoT e imprimira el
+   *     JSON en consola (incluyendo la cadena Base64 completa).
+   *  4. Intenta publicar en coco/simulador/tx si hay conexion MQTT activa.
+   *  5. Limpia el estado local para la proxima accion.
    */
   const alEnviarAudio = async () => {
     if (!uriAudio || !nombreAudio) return;
 
-    console.log(`[COCO] Enviando audio a Supabase...`);
-    console.log(`  Archivo : ${nombreAudio}`);
-    console.log(`  URI     : ${uriAudio}`);
-    console.log(`  Accion  : subir al Storage → registrar en historial_interacciones`);
+    console.log(`[COCO] Leyendo archivo de audio como Base64: ${nombreAudio}`);
 
-    // TODO: Aqui ira la llamada real a Supabase Storage + insercion en BD.
+    try {
+      // Nueva API de expo-file-system SDK 54: la clase File reemplaza a readAsStringAsync.
+      // new File(uri).base64() retorna una Promise<string> con el contenido en Base64.
+      const archivo = new File(uriAudio);
+      const base64Data = await archivo.base64();
 
-    // Limpia el estado inmediatamente para dar feedback visual al usuario.
-    // Al poner uriAudio en null, el player de expo-audio se detiene automaticamente
-    // y los botones "Escuchar" y "Enviar Audio" desaparecen de la pantalla.
-    if (reproduciendo) {
-      player.pause();
+      console.log(
+        `[COCO] Conversion Base64 exitosa. ` +
+        `Longitud de la cadena: ${base64Data.length} caracteres.`
+      );
+
+      // Despacha el audio como payload AUDIO_B64 siguiendo el Contrato IoT
+      await despachaMQTT('MENSAJE', 'AUDIO_B64', base64Data);
+
+      // Limpia el estado tras el despacho
+      if (reproduciendo) {
+        player.pause();
+      }
+      setUriAudio(null);
+      setNombreAudio(null);
+    } catch (error) {
+      console.error('[COCO] Error al leer o enviar el audio como Base64:', error);
     }
-    setUriAudio(null);
-    setNombreAudio(null);
   };
 
   // ─────────────────────────────────────────────────────────────
-  // Boton de hablar en vivo
+  // Boton de hablar en vivo — tap para iniciar, auto-para por silencio
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * Inicio de grabacion en vivo.
-   * TODO: Iniciar grabacion con expo-av (Audio.Recording).
+   * detenerGrabacion
+   * ----------------
+   * Detiene el grabador, convierte el audio a Base64 y lo despacha via MQTT.
+   * Es llamada tanto por el timer de silencio como por el boton manual.
    */
-  const alPresionarHablar = () => {
-    console.log('[COCO] Boton Hablar presionado — logica de audio pendiente.');
-  };
+  /**
+   * detenerGrabacion
+   * ----------------
+   * Detiene el grabador, limpia timers/intervalos, convierte el audio
+   * a Base64 y lo despacha via MQTT cumpliendo el Contrato IoT.
+   * @param {boolean} enviar - Si es true procesa y envía el audio; si es false lo descarta.
+   */
+  const detenerGrabacion = useCallback(async (enviar: boolean = true) => {
+    // Limpiar intervalo de monitoreo
+    if (intervaloMonitoreoRef.current) {
+      clearInterval(intervaloMonitoreoRef.current);
+      intervaloMonitoreoRef.current = null;
+    }
+
+    if (!grabandoRef.current) return;
+    grabandoRef.current = false;
+    haHabladoRef.current = false;
+    setGrabando(false);
+    setHaHablado(false);
+
+    try {
+      await audioRecorder.stop();
+
+      if (!enviar) {
+        console.log('[COCO] Grabacion descartada (sin voz detectada del usuario).');
+        return;
+      }
+
+      const uri = audioRecorder.uri;
+      if (!uri) {
+        console.warn('[COCO] La grabacion no produjo un archivo. Intenta de nuevo.');
+        return;
+      }
+
+      console.log(`[COCO] Grabacion finalizada. URI: ${uri}`);
+      console.log('[COCO] Convirtiendo a Base64...');
+
+      const archivo = new File(uri);
+      const base64Data = await archivo.base64();
+
+      console.log(
+        `[COCO] Conversion Base64 exitosa. ` +
+        `Longitud de la cadena: ${base64Data.length} caracteres.`
+      );
+
+      await despachaMQTT('MENSAJE', 'AUDIO_B64', base64Data);
+    } catch (error) {
+      console.error('[COCO] Error al procesar la grabacion:', error);
+    }
+  }, [audioRecorder, despachaMQTT]);
 
   /**
-   * Fin de grabacion en vivo.
-   * TODO: Detener grabacion, subir a Supabase Storage y registrar en historial_interacciones.
+   * Detector de voz activa (VAD)
+   * Monitorea el nivel dB y detecta:
+   * 1. Si el usuario empezo a hablar (voz sostenida por >= 200ms).
+   * 2. El ultimo momento en que se escucho voz.
    */
-  const alSoltarHablar = () => {
-    console.log('[COCO] Boton Hablar soltado — finalizando grabacion.');
+  useEffect(() => {
+    if (!grabandoRef.current || !estadoRecorder.isRecording) return;
+
+    const db = estadoRecorder.metering ?? -160;
+
+    if (db >= UMBRAL_VOZ_DB) {
+      conteoVozMsRef.current += 100;
+      ultimoSonidoRef.current = Date.now();
+
+      // Confirmar que empezo a hablar con voz sostenida (200ms)
+      if (!haHabladoRef.current && conteoVozMsRef.current >= VOZ_SOSTENIDA_MIN_MS) {
+        haHabladoRef.current = true;
+        setHaHablado(true);
+        console.log('[COCO VAD] Voz detectada — El usuario comenzo a hablar.');
+      }
+    } else {
+      // Si todavia no habia empezado a hablar, reiniciamos contador para evitar falsos positivos
+      if (!haHabladoRef.current) {
+        conteoVozMsRef.current = 0;
+      }
+    }
+  }, [estadoRecorder.metering, estadoRecorder.isRecording]);
+
+  /**
+   * alPresionarHablar
+   * -----------------
+   * Tap para iniciar grabacion con VAD de 2 fases:
+   * Fase 1: Da hasta 8s de espera generosa para que el adulto mayor comience a hablar.
+   * Fase 2: Una vez que hablo, espera 1.5s de silencio para auto-enviar.
+   */
+  const alPresionarHablar = async () => {
+    // Si ya esta grabando, un toque manual permite enviar inmediatamente
+    if (grabandoRef.current) {
+      console.log('[COCO] Detencion manual por toque.');
+      await detenerGrabacion(true);
+      return;
+    }
+
+    try {
+      const { granted } = await requestRecordingPermissionsAsync();
+      if (!granted) {
+        console.warn('[COCO] Permiso de microfono denegado.');
+        return;
+      }
+
+      await setAudioModeAsync({ playsInSilentModeIOS: true });
+
+      try {
+        await audioRecorder.prepareToRecordAsync();
+      } catch {
+        await audioRecorder.stop();
+        await audioRecorder.prepareToRecordAsync();
+      }
+
+      const ahora = Date.now();
+      inicioGrabacionRef.current = ahora;
+      ultimoSonidoRef.current = ahora;
+      conteoVozMsRef.current = 0;
+      haHabladoRef.current = false;
+
+      audioRecorder.record();
+      grabandoRef.current = true;
+      setGrabando(true);
+      setHaHablado(false);
+      console.log('[COCO VAD] Grabacion iniciada — Esperando que el usuario comience a hablar (hasta 8s)...');
+
+      // Iniciar bucle de monitoreo cada 100ms
+      if (intervaloMonitoreoRef.current) {
+        clearInterval(intervaloMonitoreoRef.current);
+      }
+
+      intervaloMonitoreoRef.current = setInterval(() => {
+        if (!grabandoRef.current) {
+          if (intervaloMonitoreoRef.current) {
+            clearInterval(intervaloMonitoreoRef.current);
+            intervaloMonitoreoRef.current = null;
+          }
+          return;
+        }
+
+        const ahoraLoop = Date.now();
+        const duracionTotal = ahoraLoop - inicioGrabacionRef.current;
+        const tiempoSilencio = ahoraLoop - ultimoSonidoRef.current;
+
+        // FASE 1: El usuario AUN NO ha comenzado a hablar
+        if (!haHabladoRef.current) {
+          if (duracionTotal >= TIEMPO_ESPERA_INICIO_MS) {
+            console.log('[COCO VAD] Tiempo de espera agotado (8s sin voz detectada). Cancelando.');
+            detenerGrabacion(false);
+            return;
+          }
+          return; // Continua esperando
+        }
+
+        // FASE 2: El usuario YA HABLO -> Detectar cuando finaliza (1.5s de silencio continuo)
+        if (tiempoSilencio >= DURACION_SILENCIO_MS) {
+          console.log(`[COCO VAD] Fin de voz detectado (${(tiempoSilencio / 1000).toFixed(1)}s de silencio). Auto-enviando...`);
+          detenerGrabacion(true);
+          return;
+        }
+
+        // FASE 3: Timeout maximo total de seguridad (20s)
+        if (duracionTotal >= TIEMPO_MAXIMO_MS) {
+          console.log('[COCO VAD] Tiempo maximo total alcanzado (20s). Auto-enviando...');
+          detenerGrabacion(true);
+          return;
+        }
+      }, 100);
+
+    } catch (error) {
+      console.error('[COCO] Error al iniciar la grabacion:', error);
+    }
   };
 
   // ─────────────────────────────────────────────────────────────
@@ -228,16 +567,19 @@ export default function PantallaPrincipal() {
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       >
 
-        {/* ── Cabecera ── */}
+        {/* Cabecera */}
         <View style={estilos.cabecera}>
           <Text style={estilos.logoTexto}>COCO</Text>
           <View style={estilos.indicadorOnline}>
-            <View style={estilos.puntito} />
-            <Text style={estilos.textoOnline}>Simulador activo</Text>
+            {/* El punto cambia de color segun el estado de conexion MQTT */}
+            <View style={[estilos.puntito, connected ? estilos.puntitoCnx : estilos.puntitoDesconectado]} />
+            <Text style={estilos.textoOnline}>
+              {connected ? 'MQTT conectado' : 'Simulador activo (sin MQTT)'}
+            </Text>
           </View>
         </View>
 
-        {/* ── Boton SOS ── */}
+        {/* Boton SOS */}
         <View style={estilos.areaSOS}>
           <View style={estilos.anilloExterior}>
             <View style={estilos.anilloMedio}>
@@ -257,7 +599,7 @@ export default function PantallaPrincipal() {
           <Text style={estilos.instruccionSOS}>Presiona si necesitas ayuda urgente</Text>
         </View>
 
-        {/* ── Herramientas de debugging ── */}
+        {/* Herramientas de debugging */}
         <View style={estilos.seccionDebug}>
 
           {/* Separador con titulo */}
@@ -267,7 +609,7 @@ export default function PantallaPrincipal() {
             <View style={estilos.lineaDivisora} />
           </View>
 
-          {/* ── Input de texto libre ── */}
+          {/* Input de texto libre */}
           <View style={estilos.filaTexto}>
             <TextInput
               style={estilos.inputTexto}
@@ -290,7 +632,7 @@ export default function PantallaPrincipal() {
             </TouchableOpacity>
           </View>
 
-          {/* ── Boton Cargar Audio ── */}
+          {/* Boton Cargar Audio */}
           <TouchableOpacity
             style={estilos.botonCargarAudio}
             onPress={alCargarAudio}
@@ -300,7 +642,6 @@ export default function PantallaPrincipal() {
             <Text style={estilos.iconoCargar}>📂</Text>
             <View style={estilos.textoCargarWrapper}>
               <Text style={estilos.textoCargarAudio}>Cargar Audio</Text>
-              {/* Muestra el nombre del archivo seleccionado si hay uno */}
               {nombreAudio ? (
                 <Text style={estilos.nombreArchivoSeleccionado} numberOfLines={1}>
                   ✓ {nombreAudio}
@@ -311,7 +652,7 @@ export default function PantallaPrincipal() {
             </View>
           </TouchableOpacity>
 
-          {/* ── Controles de audio: aparecen solo cuando hay un archivo cargado ── */}
+          {/* Controles de audio: aparecen solo cuando hay un archivo cargado */}
           {uriAudio && (
             <View style={estilos.filaControlesAudio}>
 
@@ -333,16 +674,16 @@ export default function PantallaPrincipal() {
                 </Text>
               </TouchableOpacity>
 
-              {/* Boton Enviar Audio */}
+              {/* Boton Enviar Audio como Base64 via MQTT */}
               <TouchableOpacity
                 style={[estilos.botonEnviarAudio, { flex: 1 }]}
                 onPress={alEnviarAudio}
                 activeOpacity={0.75}
-                accessibilityLabel="Enviar audio cargado a Supabase"
+                accessibilityLabel="Convertir audio a Base64 y enviar via MQTT"
               >
                 <Text style={estilos.iconoEnviarAudio}>📤</Text>
                 <View style={estilos.textoEnviarWrapper}>
-                  <Text style={estilos.textoEnviarAudio}>Enviar Audio</Text>
+                  <Text style={estilos.textoEnviarAudio}>Enviar Audio (B64)</Text>
                   <Text style={estilos.textoEnviarSub} numberOfLines={1}>
                     {nombreAudio}
                   </Text>
@@ -354,19 +695,28 @@ export default function PantallaPrincipal() {
 
         </View>
 
-        {/* ── Boton de hablar en vivo ── */}
+        {/* Boton de hablar en vivo — Zero-UI con VAD adaptativo para adultos mayores */}
         <View style={estilos.areaInferior}>
           <TouchableOpacity
-            style={estilos.botonHablar}
-            onPressIn={alPresionarHablar}
-            onPressOut={alSoltarHablar}
-            activeOpacity={0.75}
+            style={[estilos.botonHablar, grabando && estilos.botonGrabando]}
+            onPress={alPresionarHablar}
+            activeOpacity={0.85}
             accessibilityLabel="Grabar mensaje de voz en vivo"
-            accessibilityHint="Manten presionado para hablar y suelta para enviar"
+            accessibilityHint="Toca para hablar, se detiene solo cuando quedes en silencio"
           >
-            <Text style={estilos.iconoMicrofono}>🎙</Text>
-            <Text style={estilos.textoHablar}>Mantener presionado</Text>
-            <Text style={estilos.textoHablarSub}>y hablar</Text>
+            <Text style={estilos.iconoMicrofono}>
+              {grabando ? (haHablado ? '🔴' : '⏳') : '🎙'}
+            </Text>
+            <Text style={[estilos.textoHablar, grabando && estilos.textoHablarGrabando]}>
+              {grabando
+                ? (haHablado ? '● Escuchando voz...' : '● Esperando que hables...')
+                : 'Toca para hablar'}
+            </Text>
+            <Text style={estilos.textoHablarSub}>
+              {grabando
+                ? (haHablado ? 'Para solo cuando termines' : 'Tómate tu tiempo para empezar')
+                : 'Para automáticamente al silencio'}
+            </Text>
           </TouchableOpacity>
         </View>
 
@@ -375,9 +725,9 @@ export default function PantallaPrincipal() {
   );
 }
 
-/* ═══════════════════════════════════════════════════════════════
+/* =================================================================
    ESTILOS
-   ═══════════════════════════════════════════════════════════════ */
+   ================================================================= */
 const estilos = StyleSheet.create({
 
   contenedor: {
@@ -391,7 +741,7 @@ const estilos = StyleSheet.create({
     paddingVertical: 8,
   },
 
-  // ── Cabecera ──
+  // Cabecera
   cabecera: {
     alignItems: 'center',
     gap: 4,
@@ -412,7 +762,12 @@ const estilos = StyleSheet.create({
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#22C55E',
+  },
+  puntitoCnx: {
+    backgroundColor: '#22C55E',  // verde cuando hay conexion MQTT
+  },
+  puntitoDesconectado: {
+    backgroundColor: '#F59E0B',  // amarillo cuando no hay conexion
   },
   textoOnline: {
     fontSize: 12,
@@ -420,7 +775,7 @@ const estilos = StyleSheet.create({
     letterSpacing: 1,
   },
 
-  // ── Area SOS ──
+  // Area SOS
   areaSOS: {
     alignItems: 'center',
     gap: 12,
@@ -476,7 +831,7 @@ const estilos = StyleSheet.create({
     letterSpacing: 0.5,
   },
 
-  // ── Seccion de debugging ──
+  // Seccion de debugging
   seccionDebug: {
     width: '100%',
     paddingHorizontal: 20,
@@ -500,7 +855,7 @@ const estilos = StyleSheet.create({
     textTransform: 'uppercase',
   },
 
-  // ── Input de texto libre ──
+  // Input de texto libre
   filaTexto: {
     flexDirection: 'row',
     gap: 10,
@@ -535,7 +890,7 @@ const estilos = StyleSheet.create({
     color: '#FFFFFF',
   },
 
-  // ── Boton Cargar Audio ──
+  // Boton Cargar Audio
   botonCargarAudio: {
     flexDirection: 'row',
     backgroundColor: '#111827',
@@ -574,7 +929,7 @@ const estilos = StyleSheet.create({
     fontWeight: '600',
   },
 
-  // ── Area inferior ──
+  // Area inferior
   areaInferior: {
     width: '100%',
     paddingHorizontal: 24,
@@ -595,6 +950,15 @@ const estilos = StyleSheet.create({
     elevation: 8,
     gap: 2,
   },
+  // Estado activo: rojo intenso para indicar que el mic esta capturando
+  botonGrabando: {
+    backgroundColor: '#1a0000',
+    borderColor: '#EF4444',
+    shadowColor: '#EF4444',
+    shadowOpacity: 0.7,
+    shadowRadius: 16,
+    elevation: 14,
+  },
   iconoMicrofono: {
     fontSize: 32,
     marginBottom: 2,
@@ -605,12 +969,16 @@ const estilos = StyleSheet.create({
     color: '#F9FAFB',
     letterSpacing: 0.5,
   },
+  // Texto en rojo mientras graba
+  textoHablarGrabando: {
+    color: '#EF4444',
+  },
   textoHablarSub: {
     fontSize: 14,
     color: '#9CA3AF',
   },
 
-  // ── Boton Enviar Audio (aparece dinamicamente tras cargar un archivo) ──
+  // Boton Enviar Audio (aparece dinamicamente tras cargar un archivo)
   botonEnviarAudio: {
     flexDirection: 'row',
     backgroundColor: '#052e16',
@@ -637,21 +1005,21 @@ const estilos = StyleSheet.create({
   textoEnviarAudio: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#4ade80',                     // verde claro — llama la atencion como accion primaria
+    color: '#4ade80',
   },
   textoEnviarSub: {
     fontSize: 12,
     color: '#6b7280',
   },
 
-  // ── Fila de controles de audio (Escuchar + Enviar, uno al lado del otro) ──
+  // Fila de controles de audio (Escuchar + Enviar, uno al lado del otro)
   filaControlesAudio: {
     flexDirection: 'row',
     gap: 10,
     alignItems: 'stretch',
   },
 
-  // Boton Reproducir / Pausar: cuadrado a la izquierda de Enviar
+  // Boton Reproducir / Pausar
   botonReproducir: {
     backgroundColor: '#0c1a2e',
     borderWidth: 1.5,
