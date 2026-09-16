@@ -27,8 +27,11 @@ import mqtt from 'mqtt';
 import CryptoJS from 'crypto-js';
 
 // ─── Constantes del contrato de tópicos ───────────────────────────────────────
+// TOPICO_TX: estático por contrato con backend (no modificar).
 export const TOPICO_TX = 'coco/simulador/tx';
-export const TOPICO_RX = 'coco/simulador/rx';
+// TOPICO_RX: dinámico por dispositivo para evitar cruce de mensajes en producción.
+// Requerimiento de Vicente (backend) — 2026-09-15
+export const TOPICO_RX = `coco/dispositivos/${process.env.EXPO_PUBLIC_DEVICE_MAC}/rx`;
 
 // ─── Lectura de variables de entorno ─────────────────────────────────────────
 // Expo expone las variables EXPO_PUBLIC_* de .env automáticamente en tiempo de ejecución.
@@ -192,12 +195,14 @@ export function conectarMQTT(onMensaje) {
       console.log(`[MQTT] Client ID: ${clientId}`);
       console.log(`[MQTT] Endpoint:  ${AWS_IOT_ENDPOINT}`);
 
-      // Suscribirse al canal de bajada (mensajes desde el backend hacia el dispositivo)
+      // Suscribirse al canal de bajada dinámico (mensajes desde el backend hacia ESTE dispositivo)
+      // Tópico RX = coco/dispositivos/<MAC>/rx  — enrutamiento por dispositivo para producción
       client.subscribe(TOPICO_RX, { qos: 1 }, (err) => {
         if (err) {
           console.error(`[MQTT] Error al suscribirse a ${TOPICO_RX}:`, err.message);
         } else {
-          console.log(`[MQTT] Suscrito al tópico de bajada: ${TOPICO_RX}`);
+          console.log(`[MQTT] ✅ Suscrito al tópico de bajada (RX): ${TOPICO_RX}`);
+          console.log(`[MQTT] 📤 Tópico de subida  (TX): ${TOPICO_TX}  ← estático, sin cambios`);
         }
       });
 

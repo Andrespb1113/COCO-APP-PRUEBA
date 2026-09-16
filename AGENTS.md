@@ -425,3 +425,44 @@ Ahora es el flujo principal del dispositivo. Implementado con `useAudioRecorder`
 - [x] Contrato IoT estricto implementado y validado.
 - [x] Conexión MQTT en tiempo real con AWS IoT Core vía WebSockets + SigV4.
 - [x] Comunicación bidireccional completa (TX y RX probados con éxito).
+
+---
+
+### Iteración 5 — 2026-09-15: Enrutamiento MQTT dinámico por dispositivo (Rx)
+
+#### ¿Qué hicimos?
+- Se actualizó la suscripción MQTT (Rx) a una ruta dinámica por dispositivo (`coco/dispositivos/{MAC}/rx`) para evitar cruce de mensajes, manteniendo el tópico Tx estático según requerimiento del backend.
+- Requerimiento solicitado por **Vicente** (desarrollador backend) como ajuste crítico para el paso a producción.
+
+#### Detalle del cambio en `mqttClient.js`
+- `TOPICO_RX`: cambió de `'coco/simulador/rx'` (estático) a `` `coco/dispositivos/${process.env.EXPO_PUBLIC_DEVICE_MAC}/rx` `` (dinámico por MAC).
+- `TOPICO_TX`: **sin cambios** — permanece como `'coco/simulador/tx'` por contrato con el backend.
+- Los `console.log` de confirmación de suscripción ahora muestran explícitamente ambos tópicos para facilitar el debugging en campo.
+
+---
+
+### Iteración 6 — 2026-09-15: Reproducción automática de audio Rx + Barge-in
+
+#### ¿Qué hicimos?
+Se implementó la decodificación de audio Base64 a archivo local temporal y reproducción automática mediante `expo-av`, integrando lógica de Barge-in para prioridades URGENTES según el nuevo Contrato Rx confirmado por Vicente (backend).
+
+#### Contrato Rx activo
+```json
+{
+  "mac_address": "...",
+  "tipo_evento": "RESPUESTA_IA",
+  "formato_payload": "AUDIO_B64",
+  "data": "Base64String...",
+  "prioridad": "NORMAL | URGENTE"
+}
+```
+
+#### Detalle del cambio en `app/index.tsx`
+- **Imports nuevos:** `FileSystem` de `expo-file-system` y `Audio` de `expo-av`.
+- **`currentSoundRef`:** Ref que mantiene el puntero al sonido actualmente en reproducción. Necesario para el barge-in.
+- **`alRecibirMensaje` (ahora async):** Nuevo flujo de 5 pasos:
+  1. Parsea el JSON recibido. Si falla, descarta silenciosamente.
+  2. Verifica `formato_payload === 'AUDIO_B64'`. Si no es audio, solo loguea y retorna.
+  3. **Barge-in:** Si `prioridad === 'URGENTE'`, llama a `stopAsync()` + `unloadAsync()` del sonido actual antes de continuar.
+  4. Escribe `payload.data` en `FileSystem.cacheDirectory + 'temp_rx_audio.wav'` con encoding Base64.
+  5. Carga con `Audio.Sound.createAsync()` y llama a `playAsync()`. Al finalizar (`didJustFinish`), libera la memoria con `unloadAsync()` automáticamente.

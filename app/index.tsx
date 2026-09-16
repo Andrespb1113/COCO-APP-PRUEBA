@@ -37,6 +37,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
+import * as FileSystem from 'expo-file-system';
 import {
   useAudioPlayer,
   useAudioPlayerStatus,
@@ -133,6 +134,26 @@ export default function PantallaPrincipal() {
   // Ultimo mensaje recibido desde el backend (topico RX)
   const [ultimoMensajeRx, setUltimoMensajeRx] = useState<string | null>(null);
 
+  // ─── Control de reproduccion de audio entrante (Rx) ─────────────────────────
+  // URI del audio Rx a reproducir — al cambiar, useAudioPlayer crea un nuevo player.
+  // Se usa nombre de archivo único con timestamp para forzar la re-creación del hook.
+  const [rxAudioUri, setRxAudioUri] = useState<string | null>(null);
+
+  // Player dedicado al audio entrante (Rx) — se recrea automáticamente al cambiar rxAudioUri.
+  const rxPlayer = useAudioPlayer(rxAudioUri ? { uri: rxAudioUri } : null);
+
+  // Ref sincronizada con rxPlayer para acceso imperativo (barge-in desde el callback MQTT).
+  const rxPlayerRef = useRef(rxPlayer);
+  rxPlayerRef.current = rxPlayer;
+
+  // Auto-play: cuando llega un nuevo URI de audio Rx, reproducirlo inmediatamente.
+  useEffect(() => {
+    if (rxAudioUri && rxPlayer) {
+      rxPlayer.play();
+      console.log('[MQTT ← RX] ▶️  Reproduciendo audio entrante...');
+    }
+  }, [rxAudioUri]);
+
   useEffect(() => {
     // Verificacion rapida de credenciales antes de conectar
     if (!AWS_IOT_ENDPOINT) {
@@ -144,9 +165,68 @@ export default function PantallaPrincipal() {
     }
 
     // Callback que se ejecuta cuando llega un mensaje desde el backend (RX)
-    const alRecibirMensaje = (topico: string, payloadStr: string) => {
+    // Soporta el Contrato Rx de Vicente:
+    //   { mac_address, tipo_evento, formato_payload, data, prioridad }
+    //   formato_payload: 'AUDIO_B64' → decodifica, escribe en caché y reproduce.
+    //   prioridad: 'URGENTE' → barge-in (interrumpe el audio actual antes de reproducir).
+    const alRecibirMensaje = async (topico: string, payloadStr: string) => {
       console.log(`[MQTT ← RX] Mensaje recibido en '${topico}':`, payloadStr);
       setUltimoMensajeRx(payloadStr);
+
+      // ── 1. Parsear el payload ────────────────────────────────────────────────
+      let payload: {
+        mac_address?: string;
+        tipo_evento?: string;
+        formato_payload?: string;
+        data?: string;
+        prioridad?: string;
+      };
+      try {
+        payload = JSON.parse(payloadStr);
+      } catch {
+        console.warn('[MQTT ← RX] Payload no es JSON válido, se ignora.');
+        return;
+      }
+
+      // ── 2. Solo procesar si el formato es audio Base64 ──────────────────────
+      if (payload.formato_payload !== 'AUDIO_B64' || !payload.data) {
+        console.log(`[MQTT ← RX] Formato '${payload.formato_payload}' recibido — sin reproducción de audio.`);
+        return;
+      }
+
+      console.log(`[MQTT ← RX] 🎵 Audio Base64 recibido. Tipo: ${payload.tipo_evento} | Prioridad: ${payload.prioridad ?? 'NORMAL'}`);
+
+      // ── 3. Barge-in: si llega prioridad URGENTE, interrumpir sonido actual ───
+      if (payload.prioridad === 'URGENTE' && rxPlayerRef.current) {
+        try {
+          console.log('[MQTT ← RX] ⚡ Prioridad URGENTE — interrumpiendo audio en curso...');
+          rxPlayerRef.current.pause();
+          console.log('[MQTT ← RX] Audio anterior detenido.');
+        } catch (e: any) {
+          console.warn('[MQTT ← RX] Error al detener audio anterior:', e.message);
+        }
+      }
+
+      // ── 4. Escribir el archivo de audio temporal en caché ────────────────────
+      // Nombre único con timestamp para forzar la re-creación del player en el hook.
+      const rutaTemporal = FileSystem.cacheDirectory + `rx_audio_${Date.now()}.wav`;
+      try {
+        await FileSystem.writeAsStringAsync(
+          rutaTemporal,
+          payload.data,
+          { encoding: FileSystem.EncodingType.Base64 }
+        );
+        console.log(`[MQTT ← RX] Archivo temporal escrito en: ${rutaTemporal}`);
+      } catch (e: any) {
+        console.error('[MQTT ← RX] Error al escribir archivo temporal:', e.message);
+        return;
+      }
+
+      // ── 5. Disparar reproducción via cambio de estado (useAudioPlayer + useEffect) ──
+      // Al actualizar rxAudioUri, el hook useAudioPlayer recrea el player
+      // y el useEffect de auto-play lo reproduce automáticamente.
+      setRxAudioUri(rutaTemporal);
+      console.log('[MQTT ← RX] 🎵 Audio encolado para reproducción.');
     };
 
     // Conectar usando la logica de SigV4 encapsulada en mqttClient.js
