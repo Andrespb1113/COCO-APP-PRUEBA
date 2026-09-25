@@ -13,31 +13,41 @@
  *  - Compatible con Expo Go sin necesidad de Development Build.
  *  - AWS IoT Core acepta conexiones MQTT sobre WebSocket (wss://).
  *
- * Herramientas de debugging presentes:
+ * Controles principales:
  *  - Boton SOS (rojo, centro): publica evento tipo 'ALERTA_SOS' via MQTT.
- *  - Input de texto libre + boton Enviar: publica evento tipo 'MENSAJE' / 'TEXTO'.
- *  - Boton Cargar Audio: selecciona un archivo, lo convierte a Base64 y publica via MQTT.
- *  - Boton Reproducir (sonido/pausa): preescucha el audio cargado antes de enviarlo.
- *  - Boton "Mantener presionado y hablar" (inferior): graba audio en vivo, convierte a Base64
- *    y publica via MQTT al soltar (igual que el flujo de cargar archivo, pero desde el mic).
+ *  - Panel de Recepcion (centro inferior): indicador visual animado que reacciona
+ *    a los estados de reproduccion del rxPlayer (audio entrante desde la IA).
+ *    Estado Inactivo: circulo neutro estatico.
+ *    Estado Activo: circulo azul con animacion de pulso/respiracion continua.
+ *    Restauracion: vuelve suavemente al estado inactivo al terminar la reproduccion.
+ *  - Boton "Toca para hablar" (inferior): graba audio en vivo con VAD adaptativo de
+ *    2 fases y publica via MQTT al detectar silencio.
+ *
+ * Flujo de dos pasos — Notas de Voz (AUDIO_DIRECTO):
+ *  Cuando el backend envia una confirmacion de escucha (tipo_evento: 'CONFIRMACION_ESCUCHA'),
+ *  se activa isDirectAudioMode=true. El siguiente audio grabado se publica con
+ *  tipo_evento: 'AUDIO_DIRECTO' en vez de 'MENSAJE', indicandole al backend que NO
+ *  debe transcribirlo. Tras el envio, el estado vuelve automaticamente a false.
+ *
+ * Auto-grabacion Zero-UI:
+ *  Al terminar de sonar el audio de confirmacion (didJustFinish en rxPlayer),
+ *  el microfono se activa automaticamente si isDirectAudioMode=true, sin que el
+ *  adulto mayor tenga que volver a tocar la pantalla. Replica el comportamiento
+ *  del altavoz fisico COCO.
  */
 
 import React, { useRef, useState, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
-  TextInput,
   TouchableOpacity,
   StyleSheet,
   Animated,
+  Easing,
   Dimensions,
-  KeyboardAvoidingView,
-  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import * as DocumentPicker from 'expo-document-picker';
-import { File } from 'expo-file-system';
-import * as FileSystem from 'expo-file-system';
+import { File, Paths } from 'expo-file-system';
 import {
   useAudioPlayer,
   useAudioPlayerStatus,
@@ -71,23 +81,6 @@ const SOS_BUTTON_SIZE = width * 0.65;
 const MAC_ADDRESS_SIMULADOR = DEVICE_MAC;
 
 export default function PantallaPrincipal() {
-  // Estado del campo de texto libre
-  const [textoComando, setTextoComando] = useState('');
-
-  // Estado que muestra el nombre del archivo de audio seleccionado
-  const [nombreAudio, setNombreAudio] = useState<string | null>(null);
-
-  // URI local del archivo cargado (necesario para leer como Base64)
-  const [uriAudio, setUriAudio] = useState<string | null>(null);
-
-  // Player de expo-audio — se crea con el URI del archivo cuando hay uno cargado.
-  const player = useAudioPlayer(uriAudio ? { uri: uriAudio } : null);
-
-  // Estado en tiempo real del player (isPlaying, didJustFinish, etc.)
-  const estadoPlayer = useAudioPlayerStatus(player);
-
-  // Alias legible para saber si esta sonando ahora mismo
-  const reproduciendo = estadoPlayer.playing ?? false;
 
   // ─── Grabacion de audio en vivo con deteccion de silencio adaptativa (VAD) ──────
   const [grabando, setGrabando] = useState(false);
@@ -119,6 +112,17 @@ export default function PantallaPrincipal() {
   // Animacion de pulsacion para el boton SOS
   const latidoSOS = useRef(new Animated.Value(1)).current;
 
+  // ─── Animacion del Panel de Recepcion (Rx) ───────────────────────────────────
+  // Controla la escala del efecto de pulso/respiracion cuando llega audio de la IA.
+  // En estado inactivo vale 1 (sin transformacion); al reproducir, oscila entre 1 y 1.18.
+  const pulsoRx = useRef(new Animated.Value(1)).current;
+
+  // Opacidad del anillo exterior animado del panel Rx (0 en reposo, 1 al reproducir)
+  const opacidadAnilloRx = useRef(new Animated.Value(0)).current;
+
+  // Referencia al loop de animacion para poder detenerlo limpiamente
+  const animacionRxRef = useRef<Animated.CompositeAnimation | null>(null);
+
   // ─────────────────────────────────────────────────────────────
   // Cliente MQTT con SigV4 — AWS IoT Core via WebSocket
   // Las credenciales se leen de .env (EXPO_PUBLIC_AWS_*)
@@ -131,6 +135,15 @@ export default function PantallaPrincipal() {
   // Estado de conexion visible en la UI
   const [connected, setConnected] = useState(false);
 
+  // ─── Modo Nota de Voz Directa (flujo de dos pasos) ───────────────────────────
+  // Cuando este flag es true, el siguiente audio se publica como 'AUDIO_DIRECTO'
+  // (nota de voz para el familiar) en vez de 'MENSAJE' (comando para la IA).
+  // Se activa al recibir la confirmacion de escucha de la IA por el canal RX,
+  // y se resetea automaticamente despues de cada envio directo.
+  const [isDirectAudioMode, setIsDirectAudioMode] = useState(false);
+  // Ref sincronizada para acceso imperativo desde callbacks asincrono
+  const isDirectAudioModeRef = useRef(false);
+
   // Ultimo mensaje recibido desde el backend (topico RX)
   const [ultimoMensajeRx, setUltimoMensajeRx] = useState<string | null>(null);
 
@@ -141,6 +154,9 @@ export default function PantallaPrincipal() {
 
   // Player dedicado al audio entrante (Rx) — se recrea automáticamente al cambiar rxAudioUri.
   const rxPlayer = useAudioPlayer(rxAudioUri ? { uri: rxAudioUri } : null);
+
+  // Estado reactivo del player Rx: permite detectar didJustFinish para la auto-grabacion.
+  const estadoRxPlayer = useAudioPlayerStatus(rxPlayer);
 
   // Ref sincronizada con rxPlayer para acceso imperativo (barge-in desde el callback MQTT).
   const rxPlayerRef = useRef(rxPlayer);
@@ -153,6 +169,82 @@ export default function PantallaPrincipal() {
       console.log('[MQTT ← RX] ▶️  Reproduciendo audio entrante...');
     }
   }, [rxAudioUri]);
+
+  // ─── Animacion del Panel Rx: reacciona al estado de reproduccion ─────────────
+  // Cuando rxPlayer empieza a sonar → inicia el loop de pulso/respiracion.
+  // Cuando rxPlayer termina (didJustFinish) → detiene el loop y vuelve a idle.
+  useEffect(() => {
+    const reproduciendo = estadoRxPlayer.playing ?? false;
+
+    if (reproduciendo) {
+      // Limpiar animacion previa si existia
+      animacionRxRef.current?.stop();
+
+      // Fade-in del anillo exterior
+      Animated.timing(opacidadAnilloRx, {
+        toValue: 1,
+        duration: 300,
+        useNativeDriver: true,
+      }).start();
+
+      // Loop de pulso/respiracion: la escala oscila entre 1 y 1.18 continuamente
+      const loop = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulsoRx, {
+            toValue: 1.18,
+            duration: 800,
+            easing: Easing.inOut(Easing.ease),
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulsoRx, {
+            toValue: 1,
+            duration: 800,
+            easing: Easing.inOut(Easing.ease),
+            useNativeDriver: true,
+          }),
+        ])
+      );
+      animacionRxRef.current = loop;
+      loop.start();
+    } else {
+      // Detener el loop y volver suavemente al estado inactivo
+      animacionRxRef.current?.stop();
+      animacionRxRef.current = null;
+
+      Animated.parallel([
+        Animated.timing(pulsoRx, {
+          toValue: 1,
+          duration: 400,
+          easing: Easing.out(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(opacidadAnilloRx, {
+          toValue: 0,
+          duration: 400,
+          useNativeDriver: true,
+        }),
+      ]).start();
+    }
+  }, [estadoRxPlayer.playing]);
+
+  // ─── Auto-grabacion Zero-UI ──────────────────────────────────────────────────
+  // Cuando el audio de confirmacion de la IA termina de sonar (didJustFinish)
+  // y isDirectAudioMode esta activo, se activa el microfono automaticamente.
+  // Esto replica el comportamiento del altavoz fisico: el adulto mayor escucha
+  // "Ok, te escucho" y comienza a hablar sin tocar ninguna pantalla.
+  useEffect(() => {
+    if (estadoRxPlayer.didJustFinish && isDirectAudioModeRef.current) {
+      console.log(
+        '[COCO Zero-UI] 🎙 Audio de confirmacion finalizado — ' +
+        'Abriendo microfono automaticamente para Nota de Voz Directa...'
+      );
+      // Pequeño delay de 300ms para que no se corte abruptamente tras el audio
+      const timer = setTimeout(() => {
+        alPresionarHablar();
+      }, 300);
+      return () => clearTimeout(timer);
+    }
+  }, [estadoRxPlayer.didJustFinish]);
 
   useEffect(() => {
     // Verificacion rapida de credenciales antes de conectar
@@ -188,7 +280,23 @@ export default function PantallaPrincipal() {
         return;
       }
 
-      // ── 2. Solo procesar si el formato es audio Base64 ──────────────────────
+      // ── 2. Detectar confirmacion de escucha → activar modo AUDIO_DIRECTO ────
+      // El backend senaliza que el siguiente audio debe ser una nota directa
+      // enviando tipo_evento: 'CONFIRMACION_ESCUCHA'. Al detectarlo, activamos
+      // el flag para que el proximo audio se publique como 'AUDIO_DIRECTO'.
+      if (payload.tipo_evento === 'CONFIRMACION_ESCUCHA') {
+        isDirectAudioModeRef.current = true;
+        setIsDirectAudioMode(true);
+        console.log(
+          '[MQTT ← RX] 🎙 Confirmacion de escucha recibida — ' +
+          'Modo AUDIO_DIRECTO activado. El proximo audio sera una Nota de Voz.'
+        );
+        // Si el payload NO trae audio adjunto, podemos salir aqui.
+        // Si SI trae audio (el sintetico de confirmacion), continuamos para reproducirlo.
+        if (payload.formato_payload !== 'AUDIO_B64' || !payload.data) return;
+      }
+
+      // ── 3. Solo procesar si el formato es audio Base64 ──────────────────────
       if (payload.formato_payload !== 'AUDIO_B64' || !payload.data) {
         console.log(`[MQTT ← RX] Formato '${payload.formato_payload}' recibido — sin reproducción de audio.`);
         return;
@@ -208,15 +316,20 @@ export default function PantallaPrincipal() {
       }
 
       // ── 4. Escribir el archivo de audio temporal en caché ────────────────────
-      // Nombre único con timestamp para forzar la re-creación del player en el hook.
-      const rutaTemporal = FileSystem.cacheDirectory + `rx_audio_${Date.now()}.wav`;
+      // Nueva API de expo-file-system SDK 54: File + Paths reemplaza a writeAsStringAsync.
+      // Se decodifica Base64 → Uint8Array y se escribe con file.write().
+      const nombreArchivo = `rx_audio_${Date.now()}.wav`;
+      const archivoTemporal = new File(Paths.cache, nombreArchivo);
       try {
-        await FileSystem.writeAsStringAsync(
-          rutaTemporal,
-          payload.data,
-          { encoding: FileSystem.EncodingType.Base64 }
-        );
-        console.log(`[MQTT ← RX] Archivo temporal escrito en: ${rutaTemporal}`);
+        // Decodificar Base64 a bytes binarios para escritura correcta del .wav
+        const raw = atob(payload.data);
+        const bytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+          bytes[i] = raw.charCodeAt(i);
+        }
+        archivoTemporal.create();
+        archivoTemporal.write(bytes);
+        console.log(`[MQTT ← RX] Archivo temporal escrito en: ${archivoTemporal.uri}`);
       } catch (e: any) {
         console.error('[MQTT ← RX] Error al escribir archivo temporal:', e.message);
         return;
@@ -225,7 +338,7 @@ export default function PantallaPrincipal() {
       // ── 5. Disparar reproducción via cambio de estado (useAudioPlayer + useEffect) ──
       // Al actualizar rxAudioUri, el hook useAudioPlayer recrea el player
       // y el useEffect de auto-play lo reproduce automáticamente.
-      setRxAudioUri(rutaTemporal);
+      setRxAudioUri(archivoTemporal.uri);
       console.log('[MQTT ← RX] 🎵 Audio encolado para reproducción.');
     };
 
@@ -341,122 +454,7 @@ export default function PantallaPrincipal() {
     despachaMQTT('ALERTA_SOS', 'TEXTO', 'EMERGENCIA_BOTON_PANICO');
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // Input de texto libre
-  // ─────────────────────────────────────────────────────────────
 
-  /**
-   * Envia el texto escrito como un MENSAJE de tipo TEXTO hacia IoT Core.
-   */
-  const alEnviarTexto = () => {
-    if (!textoComando.trim()) return;
-    despachaMQTT('MENSAJE', 'TEXTO', textoComando.trim());
-    setTextoComando(''); // Limpia el campo tras el envio
-  };
-
-  // ─────────────────────────────────────────────────────────────
-  // Selector de archivo de audio local
-  // ─────────────────────────────────────────────────────────────
-
-  /**
-   * Abre el explorador de archivos del dispositivo filtrando por audio.
-   * Permite seleccionar un .mp3 o .wav ya guardado localmente.
-   */
-  const alCargarAudio = async () => {
-    try {
-      const resultado = await DocumentPicker.getDocumentAsync({
-        type: ['audio/mpeg', 'audio/wav', 'audio/*'],
-        copyToCacheDirectory: true, // Copia al cache para garantizar acceso de lectura
-      });
-
-      if (!resultado.canceled && resultado.assets.length > 0) {
-        const archivo = resultado.assets[0];
-        // Detener reproduccion si habia algo sonando antes de cambiar el archivo
-        if (reproduciendo) {
-          player.pause();
-        }
-        setNombreAudio(archivo.name);
-        setUriAudio(archivo.uri);
-        console.log(`[COCO] Audio seleccionado: ${archivo.name} | URI: ${archivo.uri}`);
-      } else {
-        console.log('[COCO] Seleccion de audio cancelada.');
-      }
-    } catch (error) {
-      console.error('[COCO] Error al abrir el selector de archivos:', error);
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────
-  // Reproduccion local del audio cargado (pre-envio)
-  // ─────────────────────────────────────────────────────────────
-
-  /**
-   * Alterna entre reproducir y pausar el audio cargado localmente.
-   * Usa expo-audio (reemplazo de expo-av en SDK 54).
-   */
-  const alReproducirAudio = async () => {
-    if (!uriAudio) return;
-
-    try {
-      // Configura el modo de audio: suena aunque el telefono este en silencio (iOS)
-      await setAudioModeAsync({ playsInSilentMode: true });
-
-      if (reproduciendo) {
-        player.pause();
-      } else {
-        if (estadoPlayer.didJustFinish) {
-          player.seekTo(0);
-        }
-        player.play();
-      }
-    } catch (error) {
-      console.error('[COCO] Error al reproducir el audio:', error);
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────
-  // Envio del audio como Base64 via MQTT
-  // ─────────────────────────────────────────────────────────────
-
-  /**
-   * Flujo completo de conversion y despacho de audio:
-   *
-   *  1. Lee el archivo local con FileSystem.readAsStringAsync en modo Base64.
-   *  2. Llama a despachaMQTT con tipo_evento='MENSAJE', formato_payload='AUDIO_B64'.
-   *  3. despachaMQTT ensamblara el payload via el Contrato IoT e imprimira el
-   *     JSON en consola (incluyendo la cadena Base64 completa).
-   *  4. Intenta publicar en coco/simulador/tx si hay conexion MQTT activa.
-   *  5. Limpia el estado local para la proxima accion.
-   */
-  const alEnviarAudio = async () => {
-    if (!uriAudio || !nombreAudio) return;
-
-    console.log(`[COCO] Leyendo archivo de audio como Base64: ${nombreAudio}`);
-
-    try {
-      // Nueva API de expo-file-system SDK 54: la clase File reemplaza a readAsStringAsync.
-      // new File(uri).base64() retorna una Promise<string> con el contenido en Base64.
-      const archivo = new File(uriAudio);
-      const base64Data = await archivo.base64();
-
-      console.log(
-        `[COCO] Conversion Base64 exitosa. ` +
-        `Longitud de la cadena: ${base64Data.length} caracteres.`
-      );
-
-      // Despacha el audio como payload AUDIO_B64 siguiendo el Contrato IoT
-      await despachaMQTT('MENSAJE', 'AUDIO_B64', base64Data);
-
-      // Limpia el estado tras el despacho
-      if (reproduciendo) {
-        player.pause();
-      }
-      setUriAudio(null);
-      setNombreAudio(null);
-    } catch (error) {
-      console.error('[COCO] Error al leer o enviar el audio como Base64:', error);
-    }
-  };
 
   // ─────────────────────────────────────────────────────────────
   // Boton de hablar en vivo — tap para iniciar, auto-para por silencio
@@ -513,7 +511,19 @@ export default function PantallaPrincipal() {
         `Longitud de la cadena: ${base64Data.length} caracteres.`
       );
 
-      await despachaMQTT('MENSAJE', 'AUDIO_B64', base64Data);
+      // ── Flujo de dos pasos: Notas de Voz ────────────────────────────────────
+      // Si isDirectAudioMode esta activo, publicamos como 'AUDIO_DIRECTO' para
+      // indicarle al backend que NO debe transcribir este audio (es una nota
+      // directa al familiar). Reseteamos el flag inmediatamente despues.
+      if (isDirectAudioModeRef.current) {
+        isDirectAudioModeRef.current = false;
+        setIsDirectAudioMode(false);
+        console.log('[COCO] 📨 Modo AUDIO_DIRECTO — enviando Nota de Voz directa al familiar.');
+        await despachaMQTT('AUDIO_DIRECTO', 'AUDIO_B64', base64Data);
+      } else {
+        console.log('[COCO] 🎙 Modo MENSAJE — enviando comando de voz a la IA.');
+        await despachaMQTT('MENSAJE', 'AUDIO_B64', base64Data);
+      }
     } catch (error) {
       console.error('[COCO] Error al procesar la grabacion:', error);
     }
@@ -643,12 +653,12 @@ export default function PantallaPrincipal() {
   // Render
   // ─────────────────────────────────────────────────────────────
 
+  // Alias reactivo para saber si el audio Rx esta sonando ahora mismo
+  const rxReproduciendo = estadoRxPlayer.playing ?? false;
+
   return (
     <SafeAreaView style={estilos.contenedor}>
-      <KeyboardAvoidingView
-        style={estilos.inner}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      >
+      <View style={estilos.inner}>
 
         {/* Cabecera */}
         <View style={estilos.cabecera}>
@@ -660,6 +670,13 @@ export default function PantallaPrincipal() {
               {connected ? 'MQTT conectado' : 'Simulador activo (sin MQTT)'}
             </Text>
           </View>
+          {/* Indicador del modo Nota de Voz Directa */}
+          {isDirectAudioMode && (
+            <View style={estilos.indicadorModoDirecto}>
+              <View style={estilos.puntitoPurpura} />
+              <Text style={estilos.textoModoDirecto}>NOTA DE VOZ DIRECTA</Text>
+            </View>
+          )}
         </View>
 
         {/* Boton SOS */}
@@ -682,99 +699,55 @@ export default function PantallaPrincipal() {
           <Text style={estilos.instruccionSOS}>Presiona si necesitas ayuda urgente</Text>
         </View>
 
-        {/* Herramientas de debugging */}
-        <View style={estilos.seccionDebug}>
+        {/* ─── Panel de Recepcion Visual (Rx) ─────────────────────────────────── */}
+        {/* Indicador circular animado que reacciona al audio entrante de la IA.  */}
+        {/* Estado Inactivo: circulo gris oscuro, sin animacion.                  */}
+        {/* Estado Activo: circulo azul con efecto de pulso/respiracion continuo. */}
+        <View style={estilos.seccionRx}>
 
-          {/* Separador con titulo */}
-          <View style={estilos.encabezadoDebug}>
+          {/* Etiqueta superior */}
+          <View style={estilos.encabezadoRx}>
             <View style={estilos.lineaDivisora} />
-            <Text style={estilos.tituloDebug}>Herramientas de prueba</Text>
+            <Text style={estilos.tituloRx}>
+              {rxReproduciendo ? 'COCO está hablando' : 'Esperando respuesta'}
+            </Text>
             <View style={estilos.lineaDivisora} />
           </View>
 
-          {/* Input de texto libre */}
-          <View style={estilos.filaTexto}>
-            <TextInput
-              style={estilos.inputTexto}
-              value={textoComando}
-              onChangeText={setTextoComando}
-              placeholder="Escribe un comando de texto..."
-              placeholderTextColor="#4B5563"
-              returnKeyType="send"
-              onSubmitEditing={alEnviarTexto}
-              accessibilityLabel="Campo de texto para enviar comandos"
+          {/* Indicador circular con animacion de pulso */}
+          <View style={estilos.contenedorPanelRx} accessibilityLabel="Indicador de audio entrante">
+
+            {/* Anillo exterior — aparece y desaparece con fade al cambiar estado */}
+            <Animated.View
+              style={[
+                estilos.anilloRxExterior,
+                {
+                  opacity: opacidadAnilloRx,
+                  transform: [{ scale: pulsoRx }],
+                },
+              ]}
             />
-            <TouchableOpacity
-              style={[estilos.botonEnviar, !textoComando.trim() && estilos.botonDesactivado]}
-              onPress={alEnviarTexto}
-              disabled={!textoComando.trim()}
-              activeOpacity={0.7}
-              accessibilityLabel="Enviar comando de texto"
+
+            {/* Circulo principal — cambia de color segun estado */}
+            <Animated.View
+              style={[
+                estilos.circuloRx,
+                rxReproduciendo && estilos.circuloRxActivo,
+                { transform: [{ scale: pulsoRx }] },
+              ]}
             >
-              <Text style={estilos.textoBotonEnviar}>Enviar</Text>
-            </TouchableOpacity>
+              <Text style={estilos.iconoRx}>
+                {rxReproduciendo ? '🔊' : '💤'}
+              </Text>
+              <Text style={[
+                estilos.textoEstadoRx,
+                rxReproduciendo && estilos.textoEstadoRxActivo,
+              ]}>
+                {rxReproduciendo ? 'Reproduciendo' : 'En espera'}
+              </Text>
+            </Animated.View>
+
           </View>
-
-          {/* Boton Cargar Audio */}
-          <TouchableOpacity
-            style={estilos.botonCargarAudio}
-            onPress={alCargarAudio}
-            activeOpacity={0.75}
-            accessibilityLabel="Cargar archivo de audio desde el dispositivo"
-          >
-            <Text style={estilos.iconoCargar}>📂</Text>
-            <View style={estilos.textoCargarWrapper}>
-              <Text style={estilos.textoCargarAudio}>Cargar Audio</Text>
-              {nombreAudio ? (
-                <Text style={estilos.nombreArchivoSeleccionado} numberOfLines={1}>
-                  ✓ {nombreAudio}
-                </Text>
-              ) : (
-                <Text style={estilos.textoCargarSub}>.mp3 / .wav desde tu dispositivo</Text>
-              )}
-            </View>
-          </TouchableOpacity>
-
-          {/* Controles de audio: aparecen solo cuando hay un archivo cargado */}
-          {uriAudio && (
-            <View style={estilos.filaControlesAudio}>
-
-              {/* Boton Reproducir / Pausar */}
-              <TouchableOpacity
-                style={[
-                  estilos.botonReproducir,
-                  reproduciendo && estilos.botonReproduciendose,
-                ]}
-                onPress={alReproducirAudio}
-                activeOpacity={0.75}
-                accessibilityLabel={reproduciendo ? 'Pausar audio' : 'Reproducir audio'}
-              >
-                <Text style={estilos.iconoReproducir}>
-                  {reproduciendo ? '⏸' : '🔊'}
-                </Text>
-                <Text style={estilos.textoReproducir}>
-                  {reproduciendo ? 'Pausar' : 'Escuchar'}
-                </Text>
-              </TouchableOpacity>
-
-              {/* Boton Enviar Audio como Base64 via MQTT */}
-              <TouchableOpacity
-                style={[estilos.botonEnviarAudio, { flex: 1 }]}
-                onPress={alEnviarAudio}
-                activeOpacity={0.75}
-                accessibilityLabel="Convertir audio a Base64 y enviar via MQTT"
-              >
-                <Text style={estilos.iconoEnviarAudio}>📤</Text>
-                <View style={estilos.textoEnviarWrapper}>
-                  <Text style={estilos.textoEnviarAudio}>Enviar Audio (B64)</Text>
-                  <Text style={estilos.textoEnviarSub} numberOfLines={1}>
-                    {nombreAudio}
-                  </Text>
-                </View>
-              </TouchableOpacity>
-
-            </View>
-          )}
 
         </View>
 
@@ -803,7 +776,7 @@ export default function PantallaPrincipal() {
           </TouchableOpacity>
         </View>
 
-      </KeyboardAvoidingView>
+      </View>
     </SafeAreaView>
   );
 }
@@ -856,6 +829,31 @@ const estilos = StyleSheet.create({
     fontSize: 12,
     color: '#6B7280',
     letterSpacing: 1,
+  },
+
+  // Indicador de modo Nota de Voz Directa (AUDIO_DIRECTO activo)
+  indicadorModoDirecto: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(139,92,246,0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(139,92,246,0.5)',
+    borderRadius: 20,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+  },
+  puntitoPurpura: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#A78BFA',
+  },
+  textoModoDirecto: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#A78BFA',
+    letterSpacing: 1.5,
   },
 
   // Area SOS
@@ -914,23 +912,26 @@ const estilos = StyleSheet.create({
     letterSpacing: 0.5,
   },
 
-  // Seccion de debugging
-  seccionDebug: {
+  // ─── Panel de Recepcion Visual (Rx) ──────────────────────────────────────────
+  // Contenedor de la nueva seccion que reemplaza las herramientas de debugging.
+  seccionRx: {
     width: '100%',
     paddingHorizontal: 20,
-    gap: 12,
+    gap: 16,
+    alignItems: 'center',
   },
-  encabezadoDebug: {
+  encabezadoRx: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
+    width: '100%',
   },
   lineaDivisora: {
     flex: 1,
     height: 1,
     backgroundColor: '#1F2937',
   },
-  tituloDebug: {
+  tituloRx: {
     fontSize: 11,
     fontWeight: '600',
     color: '#4B5563',
@@ -938,78 +939,68 @@ const estilos = StyleSheet.create({
     textTransform: 'uppercase',
   },
 
-  // Input de texto libre
-  filaTexto: {
-    flexDirection: 'row',
-    gap: 10,
-    alignItems: 'center',
-  },
-  inputTexto: {
-    flex: 1,
-    backgroundColor: '#111827',
-    borderWidth: 1.5,
-    borderColor: '#1F2937',
-    borderRadius: 14,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    fontSize: 15,
-    color: '#F9FAFB',
-  },
-  botonEnviar: {
-    backgroundColor: '#2563EB',
-    borderRadius: 14,
-    paddingHorizontal: 18,
-    paddingVertical: 13,
+  // Contenedor del circulo indicador
+  contenedorPanelRx: {
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  botonDesactivado: {
-    backgroundColor: '#1F2937',
-    opacity: 0.5,
-  },
-  textoBotonEnviar: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: '#FFFFFF',
+    width: 140,
+    height: 140,
   },
 
-  // Boton Cargar Audio
-  botonCargarAudio: {
-    flexDirection: 'row',
+  // Anillo exterior animado (solo visible cuando Rx esta activo)
+  anilloRxExterior: {
+    position: 'absolute',
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    borderWidth: 2,
+    borderColor: 'rgba(59,130,246,0.4)',
+    backgroundColor: 'rgba(59,130,246,0.06)',
+  },
+
+  // Circulo principal del panel Rx
+  circuloRx: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
     backgroundColor: '#111827',
-    borderWidth: 1.5,
+    borderWidth: 2,
     borderColor: '#1F2937',
-    borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 18,
     alignItems: 'center',
-    gap: 14,
+    justifyContent: 'center',
+    gap: 4,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 6,
-    elevation: 4,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 10,
+    elevation: 8,
   },
-  iconoCargar: {
-    fontSize: 30,
+
+  // Estado activo: fondo azul oscuro con borde luminoso
+  circuloRxActivo: {
+    backgroundColor: '#0c1a3a',
+    borderColor: '#3B82F6',
+    shadowColor: '#3B82F6',
+    shadowOpacity: 0.7,
+    shadowRadius: 18,
+    elevation: 16,
   },
-  textoCargarWrapper: {
-    flex: 1,
-    gap: 2,
+
+  iconoRx: {
+    fontSize: 28,
   },
-  textoCargarAudio: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#F9FAFB',
-  },
-  textoCargarSub: {
-    fontSize: 12,
-    color: '#6B7280',
-  },
-  nombreArchivoSeleccionado: {
-    fontSize: 12,
-    color: '#22C55E',
+
+  textoEstadoRx: {
+    fontSize: 10,
     fontWeight: '600',
+    color: '#4B5563',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+
+  // Texto en azul brillante cuando esta reproduciendo
+  textoEstadoRxActivo: {
+    color: '#60A5FA',
   },
 
   // Area inferior
@@ -1061,78 +1052,5 @@ const estilos = StyleSheet.create({
     color: '#9CA3AF',
   },
 
-  // Boton Enviar Audio (aparece dinamicamente tras cargar un archivo)
-  botonEnviarAudio: {
-    flexDirection: 'row',
-    backgroundColor: '#052e16',
-    borderWidth: 1.5,
-    borderColor: '#16a34a',
-    borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 18,
-    alignItems: 'center',
-    gap: 14,
-    shadowColor: '#22c55e',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 5,
-  },
-  iconoEnviarAudio: {
-    fontSize: 28,
-  },
-  textoEnviarWrapper: {
-    flex: 1,
-    gap: 2,
-  },
-  textoEnviarAudio: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#4ade80',
-  },
-  textoEnviarSub: {
-    fontSize: 12,
-    color: '#6b7280',
-  },
 
-  // Fila de controles de audio (Escuchar + Enviar, uno al lado del otro)
-  filaControlesAudio: {
-    flexDirection: 'row',
-    gap: 10,
-    alignItems: 'stretch',
-  },
-
-  // Boton Reproducir / Pausar
-  botonReproducir: {
-    backgroundColor: '#0c1a2e',
-    borderWidth: 1.5,
-    borderColor: '#1d4ed8',
-    borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 4,
-    minWidth: 80,
-    shadowColor: '#3b82f6',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.2,
-    shadowRadius: 6,
-    elevation: 4,
-  },
-  // Estado activo (mientras suena): borde azul mas brillante
-  botonReproduciendose: {
-    borderColor: '#60a5fa',
-    backgroundColor: '#0f2340',
-    shadowOpacity: 0.5,
-  },
-  iconoReproducir: {
-    fontSize: 24,
-  },
-  textoReproducir: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#60a5fa',
-    letterSpacing: 0.5,
-  },
 });

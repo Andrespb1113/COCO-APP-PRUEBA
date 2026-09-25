@@ -8,7 +8,7 @@
  * Topico de publicacion : coco/simulador/tx
  * Topico de suscripcion : coco/simulador/rx
  *
- * Tipos de evento validos  : 'MENSAJE' | 'ALERTA_SOS'
+ * Tipos de evento validos  : 'MENSAJE' | 'ALERTA_SOS' | 'AUDIO_DIRECTO'
  * Formatos de payload validos: 'TEXTO'  | 'AUDIO_B64'
  *
  * Las constantes de conexion ahora se leen desde variables de entorno (.env).
@@ -24,7 +24,8 @@ export const TOPICO_TX = 'coco/simulador/tx';
 export const TOPICO_RX = 'coco/simulador/rx';
 
 // --- Conjuntos de valores permitidos ---
-const TIPOS_EVENTO_VALIDOS     = ['MENSAJE', 'ALERTA_SOS'];
+// 'AUDIO_DIRECTO' = Nota de voz directa al familiar (no pasa por transcripción de IA)
+const TIPOS_EVENTO_VALIDOS     = ['MENSAJE', 'ALERTA_SOS', 'AUDIO_DIRECTO'];
 const FORMATOS_PAYLOAD_VALIDOS = ['TEXTO', 'AUDIO_B64'];
 
 /**

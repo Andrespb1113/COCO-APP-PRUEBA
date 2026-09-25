@@ -466,3 +466,199 @@ Se implementó la decodificación de audio Base64 a archivo local temporal y rep
   3. **Barge-in:** Si `prioridad === 'URGENTE'`, llama a `stopAsync()` + `unloadAsync()` del sonido actual antes de continuar.
   4. Escribe `payload.data` en `FileSystem.cacheDirectory + 'temp_rx_audio.wav'` con encoding Base64.
   5. Carga con `Audio.Sound.createAsync()` y llama a `playAsync()`. Al finalizar (`didJustFinish`), libera la memoria con `unloadAsync()` automáticamente.
+
+---
+
+### Iteración 11 — 2026-09-18: Flujo de Dos Pasos para Notas de Voz (AUDIO_DIRECTO)
+
+> Se implementó el flujo de dos pasos para Notas de Voz (AUDIO_DIRECTO), añadiendo un estado de grabación que modifica condicionalmente el `tipo_evento` del JSON enviado a AWS IoT Core.
+
+#### ¿Qué problema resolvimos?
+- Cuando un adulto mayor quería dejar una nota de voz directa a un familiar, el sistema enviaba el audio con `tipo_evento: "MENSAJE"`, lo que hacía que la IA intentara transcribirlo e interpretarlo como un comando. Esto era incorrecto: el audio debía llegar directamente al familiar sin procesamiento.
+
+#### ¿Qué hicimos?
+
+**1. Nuevo estado `isDirectAudioMode` en `app/index.tsx`**
+- Se añadió `const [isDirectAudioMode, setIsDirectAudioMode] = useState(false)` y su ref sincronizada `isDirectAudioModeRef` para acceso imperativo desde callbacks asíncronos.
+- El flag controla si el siguiente audio se publica como `'AUDIO_DIRECTO'` (nota al familiar) o `'MENSAJE'` (comando a la IA).
+
+**2. Activación en el canal RX (`alRecibirMensaje`)**
+- Al recibir un mensaje descendente con `tipo_evento === 'CONFIRMACION_ESCUCHA'`, el sistema activa `isDirectAudioModeRef.current = true` y `setIsDirectAudioMode(true)`.
+- Si el payload de confirmación trae audio adjunto (`AUDIO_B64`), lo reproduce normalmente (el sintetizador de voz dice "Ok, te escucho"). Si no trae audio, retorna inmediatamente.
+- Se loguea `'[MQTT ← RX] 🎙 Confirmacion de escucha recibida — Modo AUDIO_DIRECTO activado.'` para trazabilidad.
+
+**3. Bifurcación del payload de salida (TX)**
+- Se modificaron **dos puntos** de envío de audio:
+  - `alEnviarAudio` (botón de archivo cargado)
+  - `detenerGrabacion` (grabación en vivo por VAD)
+- En ambas funciones, se evalúa `isDirectAudioModeRef.current`:
+  - **Si `true`:** Envía con `tipo_evento: 'AUDIO_DIRECTO'` y resetea el flag inmediatamente (`isDirectAudioModeRef.current = false`, `setIsDirectAudioMode(false)`).
+  - **Si `false`:** Envía con `tipo_evento: 'MENSAJE'` (comportamiento previo).
+
+**4. Contrato IoT actualizado (`iotContract.js`)**
+- Se añadió `'AUDIO_DIRECTO'` al array `TIPOS_EVENTO_VALIDOS`.
+- La validación de `generarPayload` ya no rechaza este tipo de evento.
+
+**5. Indicador visual en la cabecera**
+- Cuando `isDirectAudioMode` es `true`, aparece un badge púrpura (`🟣 NOTA DE VOZ DIRECTA`) en la cabecera de la app.
+- Al enviar el audio directo, el badge desaparece automáticamente.
+
+#### Contrato JSON de salida cuando el modo está activo
+```json
+{
+  "mac_address": "00:11:22:AA:BB:CC",
+  "tipo_evento": "AUDIO_DIRECTO",
+  "formato_payload": "AUDIO_B64",
+  "data": "UklGRiQAAABXQVZF...",
+  "timestamp_iso": "2026-09-18T04:00:00.000Z"
+}
+```
+
+#### Archivos modificados
+- `app/index.tsx` — Nuevo estado `isDirectAudioMode` + detección en RX + bifurcación en TX + badge visual.
+- `iotContract.js` — Añadido `'AUDIO_DIRECTO'` a `TIPOS_EVENTO_VALIDOS`.
+
+#### Regla crítica a recordar (8)
+> **El `tipo_evento: 'CONFIRMACION_ESCUCHA'` en el canal RX es el disparador del modo AUDIO_DIRECTO.**
+> El backend debe enviar este tipo de evento cuando el flujo corresponda a una nota de voz directa.
+> No usar ningún otro campo o valor para activar este modo.
+
+#### Próximos pasos pendientes
+- [ ] Coordinar con el equipo de backend el contrato exacto del mensaje `CONFIRMACION_ESCUCHA` (¿incluye audio sintético adjunto o es solo el disparador?).
+- [x] Implementar auto-grabación al terminar el audio de confirmación (Iteración 12).
+- [ ] Validar el flujo completo end-to-end: SOS → backend responde con `CONFIRMACION_ESCUCHA` → micrófono se abre solo → se publica `AUDIO_DIRECTO` → familiar recibe la nota.
+
+---
+
+### Iteración 12 — 2026-09-18: Auto-grabación Zero-UI al terminar el audio de confirmación
+
+> Se implementó la apertura automática del micrófono al terminar de sonar el audio de confirmación de la IA (*"Ok, te escucho"*), eliminando la necesidad de volver a tocar la pantalla para grabar la nota de voz directa. Esto replica el comportamiento del altavoz físico COCO.
+
+#### ¿Qué problema resolvimos?
+En la iteración anterior, el flujo de dos pasos requería que el adulto mayor tocara la pantalla dos veces:
+1. Para decirle a COCO que quería mandar un audio.
+2. Para iniciar la grabación de la nota directa después de escuchar la confirmación.
+
+Para una persona mayor, esto rompía la ilusión del dispositivo Zero-UI y era propenso a errores.
+
+#### ¿Qué hicimos?
+
+**Nuevo `useEffect` de Auto-grabación en `app/index.tsx`:**
+- Se añadió `useAudioPlayerStatus(rxPlayer)` como `estadoRxPlayer` para observar el estado del player de audio entrante (Rx) en tiempo real.
+- Se agregó un `useEffect` que se dispara cuando `estadoRxPlayer.didJustFinish` cambia a `true`.
+- Dentro de ese efecto, si `isDirectAudioModeRef.current` es `true` (el modo Nota de Voz Directa está armado), se llama automáticamente a `alPresionarHablar()` después de un delay de **300ms**.
+- El delay de 300ms sirve para que no haya un corte abrupto entre el final del audio de confirmación y el inicio del micrófono.
+
+#### Flujo completo del simulador ahora (One-Touch Zero-UI)
+
+```
+1. Adulto mayor presiona el botón UNA SOLA VEZ
+2. Habla: "Oye COCO, mándale un audio a mi hija"
+3. [Silencio 1.5s] → VAD auto-envía con tipo_evento: "MENSAJE"
+4. Backend procesa e invoca TTS: "Ok, te escucho"
+5. Backend publica en coco/dispositivos/<MAC>/rx:
+   { tipo_evento: "CONFIRMACION_ESCUCHA", formato_payload: "AUDIO_B64", data: "..." }
+6. App detecta CONFIRMACION_ESCUCHA → isDirectAudioMode = true
+7. App reproduce el audio "Ok, te escucho"
+8. [Audio termina: didJustFinish = true]
+9. ⏱ 300ms de pausa natural
+10. 🎙️ Micrófono se abre SOLO (alPresionarHablar automático)
+11. Adulto mayor habla: "Hola hija, ¿vendrás a almorzar?"
+12. [Silencio 1.5s] → VAD auto-envía con tipo_evento: "AUDIO_DIRECTO"
+13. isDirectAudioMode = false (reseteo automático)
+14. ✅ Familiar recibe la nota de voz directa
+```
+
+#### Archivos modificados
+- `app/index.tsx` — `estadoRxPlayer` con `useAudioPlayerStatus(rxPlayer)` + nuevo `useEffect` de auto-grabación + delay de 300ms + logs de trazabilidad.
+
+#### Regla crítica a recordar (9)
+> **`alPresionarHablar` se usa en dos contextos:** manual (toque del botón) y automático (auto-grabación Zero-UI).
+> Ambos comparten la misma función, que tiene una guardia interna: si ya está grabando al llamarla, detiene y envía inmediatamente en vez de iniciar otra sesión.
+> Esta guardia es suficiente protección contra doble llamada.
+
+#### Próximos pasos pendientes
+- [ ] Validar el flujo end-to-end completo con un dispositivo físico y el backend real de Vicente.
+- [ ] Evaluar si el delay de 300ms es adecuado en campo o si debe ajustarse (puede aumentarse a 500ms si el adulto mayor necesita más tiempo de reacción).
+
+---
+
+### Iteración 12 — 2026-09-22: Fix writeAsStringAsync en handler de audio RX
+
+#### ¿Qué bug se corrigió?
+
+**`writeAsStringAsync` lanza error en SDK 54 al recibir audio del backend**
+- **Error:** `Method writeAsStringAsync imported from "expo-file-system" is deprecated.`
+- **Síntoma:** El audio Base64 llegaba correctamente por MQTT (`coco/simulador/rx`), se decodificaba el payload, pero al intentar escribir el archivo temporal `.wav` en caché, la API legacy crasheaba y el audio nunca se reproducía.
+- **Causa:** El handler `alRecibirMensaje` usaba `FileSystem.writeAsStringAsync()`, `FileSystem.cacheDirectory` y `FileSystem.EncodingType.Base64` — toda la API legacy de `expo-file-system` que está eliminada en SDK 54. Esto ya estaba documentado como Regla 4 para la lectura (`readAsStringAsync`), pero el mismo patrón se había colado en la escritura RX.
+- **Fix:** Migrado a la nueva API `File` + `Paths` de `expo-file-system` SDK 54:
+  1. `new File(Paths.cache, 'rx_audio_TIMESTAMP.wav')` reemplaza a `FileSystem.cacheDirectory + nombre`.
+  2. `atob(base64)` → `Uint8Array` decodifica los bytes del audio.
+  3. `archivoTemporal.create()` + `archivoTemporal.write(bytes)` reemplaza a `writeAsStringAsync`.
+  4. `archivoTemporal.uri` se pasa a `setRxAudioUri` para que el hook `useAudioPlayer` lo reproduzca.
+
+#### Archivos modificados
+- `app/index.tsx` — Import cambiado de `{ File }` + `* as FileSystem` a `{ File, Paths }`. Handler de audio RX reescrito con nueva API. Comentario legacy actualizado.
+
+#### Regla crítica a recordar (10)
+> **NUNCA usar `writeAsStringAsync` en SDK 54.** Tiene la misma restricción que `readAsStringAsync` (Regla 4).
+> Para escribir archivos, usar siempre la nueva API: `new File(Paths.cache, nombre)` → `file.create()` → `file.write(datos)`.
+> Para datos binarios (como audio Base64), decodificar primero con `atob()` → `Uint8Array` y luego `file.write(bytes)`.
+
+#### Próximos pasos pendientes
+- [x] Validar el flujo end-to-end completo con un dispositivo físico y el backend real de Vicente.
+- [x] Evaluar si el delay de 300ms es adecuado en campo o si debe ajustarse.
+
+---
+
+### Iteración 12 — 2026-09-23: Limpieza de UI de debugging + Panel de Recepción Visual Animado
+
+> Se eliminaron los inputs de texto/archivos de depuración y se implementó un indicador visual animado que reacciona reactivamente a los estados de reproducción de expo-audio para el audio entrante.
+
+#### ¿Qué hicimos?
+
+**1. Limpieza de UI de debugging (injección manual)**
+- Eliminados por completo del código:
+  - `TextInput` y el estado `textoComando` (input de texto libre).
+  - `expo-document-picker` y el selector de archivos locales (`alCargarAudio`).
+  - El player local `useAudioPlayer` + `useAudioPlayerStatus` para pre-escucha (`player`, `estadoPlayer`, `reproduciendo`).
+  - Las funciones `alEnviarTexto`, `alCargarAudio`, `alReproducirAudio`, `alEnviarAudio`.
+  - Los estados `nombreAudio`, `uriAudio`.
+  - El `KeyboardAvoidingView` y los imports de `Platform` (ya no hace falta con el teclado eliminado).
+  - Todos los estilos huérfanos de debug: `seccionDebug`, `encabezadoDebug`, `tituloDebug`, `filaTexto`, `inputTexto`, `botonEnviar`, `botonDesactivado`, `textoBotonEnviar`, `botonCargarAudio`, `iconoCargar`, `textoCargarWrapper`, `textoCargarAudio`, `textoCargarSub`, `nombreArchivoSeleccionado`, `botonEnviarAudio`, `iconoEnviarAudio`, `textoEnviarWrapper`, `textoEnviarAudio`, `textoEnviarSub`, `filaControlesAudio`, `botonReproducir`, `botonReproduciendose`, `iconoReproducir`, `textoReproducir`.
+
+**2. Nuevo Panel de Recepción Visual (`seccionRx`)**
+- Reemplaza la `seccionDebug` en el layout entre el botón SOS y el botón de grabar.
+- Compuesto por:
+  - **Etiqueta dinámica** (`tituloRx`): cambia entre `'Esperando respuesta'` y `'COCO está hablando'` según `rxReproduciendo`.
+  - **Anillo exterior animado** (`anilloRxExterior`): aparece/desaparece con fade y se escala con el pulso. Completamente transparente en reposo.
+  - **Círculo principal** (`circuloRx`): fondo `#111827` neutro en reposo → fondo `#0c1a3a` con borde azul `#3B82F6` y sombra azul al reproducir.
+  - **Ícono central**: `💤` en reposo, `🔊` al reproducir.
+  - **Texto de estado**: `'En espera'` gris → `'Reproduciendo'` azul (`#60A5FA`).
+
+**3. Lógica de animación — 3 valores `Animated`**
+- `pulsoRx` — Escala oscilante (1 → 1.18 → 1, ciclos de 800ms cada dirección) aplicada TANTO al anillo exterior COMO al círculo principal para un efecto de "respiración" cohesivo.
+- `opacidadAnilloRx` — Fade del anillo de 0 a 1 al activarse (300ms) y de 1 a 0 al desactivarse (400ms).
+- `animacionRxRef` — `useRef` para guardar la referencia al `Animated.loop` activo y poder detenerlo limpiamente sin memory leaks.
+
+**4. Estados de transición vinculados a `estadoRxPlayer.playing`**
+
+| Estado de rxPlayer | Acción de animación |
+|---|---|
+| `playing: false` → `true` | Fade-in del anillo + inicia loop de pulso |
+| `playing: true` → `false` (incluye `didJustFinish`) | Para el loop + Animated.parallel de vuelta suave a escala 1 y opacidad 0 |
+
+#### Archivos modificados
+- `app/index.tsx` — Limpieza completa de debugging. Nuevas constantes `pulsoRx`, `opacidadAnilloRx`, `animacionRxRef`. Nuevo `useEffect` de animación. Nueva sección JSX `seccionRx`. Nuevos estilos: `seccionRx`, `encabezadoRx`, `tituloRx`, `contenedorPanelRx`, `anilloRxExterior`, `circuloRx`, `circuloRxActivo`, `iconoRx`, `textoEstadoRx`, `textoEstadoRxActivo`.
+- `AGENTS.md` — Añadida esta entrada de iteración.
+
+#### Imports eliminados
+- `TextInput`, `KeyboardAvoidingView`, `Platform` — de `react-native`
+- `* as DocumentPicker` — de `expo-document-picker`
+
+#### Import añadido
+- `Easing` — de `react-native` (necesario para `Easing.inOut(Easing.ease)` y `Easing.out(Easing.ease)` en las animaciones de pulso)
+
+#### Próximos pasos pendientes
+- [ ] Probar en campo la respuesta visual del panel Rx con audio real del backend.
+- [ ] Considerar añadir una onda de audio visual (waveform animado) dentro del círculo para mayor expresividad en futuras iteraciones.
